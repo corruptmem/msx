@@ -26,11 +26,11 @@ jobs:
       - name: gofmt check
         shell: bash
         run: |
-          mapfile -t files < <(git ls-files '*.go')
-          if [ "${#files[@]}" -eq 0 ]; then
+          files="$(git ls-files '*.go')"
+          if [ -z "$files" ]; then
             exit 0
           fi
-          out="$(gofmt -l "${files[@]}")"
+          out="$(printf '%s\n' "$files" | xargs gofmt -l)"
           if [ -n "$out" ]; then
             printf '%s\n' "$out"
             exit 1
