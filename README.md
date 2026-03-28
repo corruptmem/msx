@@ -78,33 +78,72 @@ Default state location:
 Override with:
 - `MSX_HOME=/some/path`
 
-### Optional encryption at rest
+### Token store encryption (`MSX_STORE_KEY`)
 
-By default msx relies on filesystem permissions (`0700` dir, `0600` DB file).
-For environments that require more, set `MSX_STORE_KEY` to a 32-byte key:
+`MSX_STORE_KEY` controls how token values are stored on disk.  Three modes
+are supported:
+
+| Value | Behaviour |
+|---|---|
+| *(not set)* | Plain text, **warning printed to stderr** on every invocation. |
+| `unsafe-plain` | Plain text, warning suppressed (explicit acknowledgement). |
+| `aes-256-gcm:<hex-key>` | AES-256-GCM encryption; key is 32 bytes as 64 hex chars. |
+| `keyring` | Key stored in / retrieved from the platform keyring (see below). |
+
+Token values are encrypted in the bbolt store using **AES-256-GCM** with a
+random 12-byte nonce per write.  Profile metadata (client ID, authority,
+scopes) is not encrypted.
+
+**Consistency is enforced**: if stored tokens were written in one mode and
+read in another, msx will fail with a clear error rather than silently
+mis-reading data.
+
+#### `aes-256-gcm` mode
 
 ```sh
 # Generate a key (store it somewhere safe — 1Password works well):
 openssl rand -hex 32
 
-# Then export it in every shell session that runs msx:
-export MSX_STORE_KEY=<64 hex chars>
+# Export it in every shell session that runs msx:
+export MSX_STORE_KEY=aes-256-gcm:<64-hex-chars>
 ```
 
-When the variable is set, token values are encrypted in the bbolt store using
-**AES-256-GCM** with a random 12-byte nonce per write.  Profile metadata
-(client ID, authority, scopes) is not encrypted.
-
-Key management expectations:
 - The key is **never persisted to disk** by msx.  You are responsible for keeping it.
 - If you lose the key you can still recover tokens using `state-export` while
   the key is available, then reinstate them with `state-import` once you have
   a replacement.
-- Consistency is enforced: if a key is set but stored tokens are plain (or
-  vice versa), msx will fail with a clear error rather than silently
-  mis-reading data.
-- Encryption is optional.  Plain-mode operation (no key) is the default and
-  remains fully supported.
+- Best for: automation, CI/CD, scripts where you control the environment.
+
+#### `keyring` mode
+
+```sh
+export MSX_STORE_KEY=keyring
+```
+
+msx uses the platform keyring to store and retrieve the encryption key:
+- **macOS** — Keychain
+- **Linux** — Secret Service (GNOME Keyring / KWallet) with a file-backend
+  fallback for headless environments
+- **Windows** — DPAPI / Windows Credential Manager
+
+If no key exists yet, msx generates a 32-byte random key and saves it
+automatically.  The key is stored under service `msx`, item `store-key`.
+
+- Best for: interactive developer machines where you want zero key management.
+- Note: may prompt interactively on some platforms.  For automation use
+  `aes-256-gcm:<hex-key>` instead.
+
+#### `unsafe-plain` mode
+
+```sh
+export MSX_STORE_KEY=unsafe-plain
+```
+
+Tokens are stored as plain JSON.  This is the default when `MSX_STORE_KEY` is
+absent, but setting it explicitly suppresses the startup warning.
+
+- Best for: trusted single-user machines or environments where filesystem
+  permissions (`0700` dir, `0600` DB file) are your only security boundary.
 
 Stored per profile:
 - authority / tenant hint
