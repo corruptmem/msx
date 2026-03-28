@@ -1,4 +1,4 @@
-msx
+/msx
 *.test
 coverage.out
 .DS_Store
