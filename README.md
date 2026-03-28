@@ -133,6 +133,7 @@ msx mail --profile personal --top 10
 msx mail --profile personal --sender noreply@example.com --since 2026-03-01T00:00:00Z
 msx mail --profile personal --folder inbox --unread --top 25
 msx mail --profile personal --query invoice --top 20
+msx mail --profile personal --subject invoice --top 50
 ```
 
 ### Calendar lookup
@@ -148,6 +149,7 @@ msx agenda --profile personal --query dentist
 msx files --profile personal --top 20
 msx files --profile personal --path Documents
 msx files --profile personal --query passport --top 20
+msx files --profile personal --path Documents --kind folders
 ```
 
 ### Contacts
@@ -188,7 +190,8 @@ Current choices made for agent use:
 - profile selection is explicit and cheap
 - read-only operations for safe automation
 - globals can appear before or after subcommands
-- basic input validation for common footguns (`--top > 0`, valid RFC3339 timestamps, `--end` after `--start`)
+- basic input validation for common footguns (`--top > 0`, valid RFC3339 timestamps, `--end` after `--start`, constrained enums like `--kind`)
+- client-side narrowing where it improves ergonomics without hiding Graph data (`mail --subject`, `files --kind`)
 
 ## Safety
 
@@ -211,15 +214,17 @@ Covered areas now include:
 - token JSON parsing and refresh-token preservation
 - store durability/serialization behavior
 - forced refresh persistence
-- Graph `401` retry behavior
-- CLI global flag parsing and event filtering helpers
+- Graph `401` retry behavior and search headers
+- CLI global flag parsing, help-path behavior, and filtering helpers for mail/events/files
 
 ## CI
 
 GitHub Actions now runs on push and pull request:
 - `gofmt -l .` to catch formatting drift
+- `go vet ./...`
 - `go test ./...`
 - `go build ./cmd/msx`
+- `go test -race ./...` on Ubuntu for the concurrency-sensitive auth/store path
 - matrix coverage on Ubuntu, macOS, and Windows
 
 ## Verified non-destructive flows

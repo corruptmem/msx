@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,23 +20,28 @@ type globalFlags struct {
 	format  string
 }
 
+var errHelpShown = errors.New("help shown")
+
 const usageText = `usage: msx [--profile name] [--format text|json] <command> [flags]
 
 commands:
-  login       Start device-code login and save tokens locally
-  import-op   Import an existing Microsoft account from 1Password
-  profiles    List configured profiles
-  whoami      Show the current Graph account
-  mail        List mail with optional filters
-  agenda      List calendar events in a time range
-  files       List or search OneDrive files
-  contacts    List or search contacts
-  sites       Search SharePoint / org sites
-  help        Show this message
+  login         Start device-code login and save tokens locally
+  import-op     Import an existing Microsoft account from 1Password
+  profiles      List configured profiles
+  whoami        Show the current Graph account
+  mail          List mail with optional filters
+  agenda        List calendar events in a time range
+  files         List or search OneDrive files
+  contacts      List or search contacts
+  sites         Search SharePoint / org sites
+  help          Show this message
 `
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, errHelpShown) {
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -47,10 +53,10 @@ func run(args []string) error {
 		return err
 	}
 	if len(rest) == 0 {
-		return usage()
+		return showUsage(true, "")
 	}
 	if rest[0] == "help" || rest[0] == "--help" || rest[0] == "-h" {
-		return usage()
+		return showUsage(false, "")
 	}
 
 	s, err := store.Open("")
@@ -81,7 +87,7 @@ func run(args []string) error {
 	case "sites":
 		return cmdSites(s, g, rest)
 	default:
-		return usage()
+		return showUsage(true, fmt.Sprintf("unknown command %q", cmd))
 	}
 }
 
@@ -117,8 +123,19 @@ func parseGlobals(args []string) (globalFlags, []string, error) {
 	return g, out, nil
 }
 
-func usage() error {
-	return fmt.Errorf(usageText)
+func showUsage(asError bool, prefix string) error {
+	if asError {
+		if prefix != "" {
+			return fmt.Errorf("%s\n\n%s", prefix, usageText)
+		}
+		return fmt.Errorf(usageText)
+	}
+	if prefix != "" {
+		fmt.Fprintln(os.Stdout, prefix)
+		fmt.Fprintln(os.Stdout)
+	}
+	_, _ = fmt.Fprint(os.Stdout, usageText)
+	return errHelpShown
 }
 
 func cmdLogin(s *store.Store, g globalFlags, args []string) error {
@@ -200,6 +217,7 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	top := fs.Int("top", 10, "maximum number of messages")
 	sender := fs.String("sender", "", "exact sender email filter")
 	query := fs.String("query", "", "Graph search expression text")
+	subject := fs.String("subject", "", "case-insensitive subject substring filter applied client-side")
 	since := fs.String("since", "", "received since RFC3339 timestamp")
 	folder := fs.String("folder", "inbox", "well-known mail folder or folder id")
 	unread := fs.Bool("unread", false, "only include unread messages")
@@ -235,6 +253,9 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", path, q)
 	if err != nil {
 		return err
+	}
+	if *subject != "" {
+		data["value"] = filterMailBySubject(data["value"], *subject)
 	}
 	return emit(g, data)
 }
@@ -283,11 +304,15 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	top := fs.Int("top", 25, "maximum number of items")
 	path := fs.String("path", "", "folder path to list")
 	query := fs.String("query", "", "search query")
+	kind := fs.String("kind", "all", "all|files|folders")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := requirePositive("--top", *top); err != nil {
 		return err
+	}
+	if *kind != "all" && *kind != "files" && *kind != "folders" {
+		return fmt.Errorf("--kind must be all, files, or folders")
 	}
 	endpoint := "/me/drive/root/children"
 	params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,name,webUrl,file,folder,size,lastModifiedDateTime,parentReference"}
@@ -299,6 +324,9 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", endpoint, params)
 	if err != nil {
 		return err
+	}
+	if *kind != "all" {
+		data["value"] = filterDriveItems(data["value"], *kind)
 	}
 	return emit(g, data)
 }
@@ -375,20 +403,48 @@ func escapePathSegment(v string) string {
 	return strings.ReplaceAll(v, "'", "''")
 }
 
+func filterMailBySubject(v any, q string) []map[string]any {
+	return filterRows(v, func(row map[string]any) bool {
+		subject, _ := row["subject"].(string)
+		return strings.Contains(strings.ToLower(subject), strings.ToLower(q))
+	})
+}
+
 func filterEvents(v any, q string) []map[string]any {
+	q = strings.ToLower(q)
+	return filterRows(v, func(row map[string]any) bool {
+		blob, _ := json.Marshal(row)
+		return strings.Contains(strings.ToLower(string(blob)), q)
+	})
+}
+
+func filterDriveItems(v any, kind string) []map[string]any {
+	return filterRows(v, func(row map[string]any) bool {
+		_, hasFile := row["file"]
+		_, hasFolder := row["folder"]
+		switch kind {
+		case "files":
+			return hasFile && !hasFolder
+		case "folders":
+			return hasFolder
+		default:
+			return true
+		}
+	})
+}
+
+func filterRows(v any, keep func(map[string]any) bool) []map[string]any {
 	items, ok := v.([]any)
 	if !ok {
 		return nil
 	}
-	q = strings.ToLower(q)
 	out := []map[string]any{}
 	for _, item := range items {
 		row, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
-		blob, _ := json.Marshal(row)
-		if strings.Contains(strings.ToLower(string(blob)), q) {
+		if keep(row) {
 			out = append(out, row)
 		}
 	}

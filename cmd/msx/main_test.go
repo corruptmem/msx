@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -25,6 +26,12 @@ func TestParseGlobalsRejectsInvalidFormat(t *testing.T) {
 	}
 }
 
+func TestShowUsageHelpPath(t *testing.T) {
+	if err := showUsage(false, ""); !errors.Is(err, errHelpShown) {
+		t.Fatalf("expected errHelpShown, got %v", err)
+	}
+}
+
 func TestFilterEventsMatchesNestedFieldsCaseInsensitively(t *testing.T) {
 	in := []any{
 		map[string]any{"subject": "Dentist", "location": map[string]any{"displayName": "Main Street"}},
@@ -37,6 +44,32 @@ func TestFilterEventsMatchesNestedFieldsCaseInsensitively(t *testing.T) {
 	blob, _ := json.Marshal(out[0])
 	if string(blob) == "" {
 		t.Fatal("expected event payload")
+	}
+}
+
+func TestFilterMailBySubject(t *testing.T) {
+	in := []any{
+		map[string]any{"subject": "Monthly Invoice"},
+		map[string]any{"subject": "Dinner"},
+	}
+	out := filterMailBySubject(in, "invoice")
+	if len(out) != 1 || out[0]["subject"] != "Monthly Invoice" {
+		t.Fatalf("unexpected filtered mail: %#v", out)
+	}
+}
+
+func TestFilterDriveItems(t *testing.T) {
+	in := []any{
+		map[string]any{"name": "notes.txt", "file": map[string]any{}},
+		map[string]any{"name": "docs", "folder": map[string]any{}},
+	}
+	files := filterDriveItems(in, "files")
+	folders := filterDriveItems(in, "folders")
+	if len(files) != 1 || files[0]["name"] != "notes.txt" {
+		t.Fatalf("unexpected files filter result: %#v", files)
+	}
+	if len(folders) != 1 || folders[0]["name"] != "docs" {
+		t.Fatalf("unexpected folders filter result: %#v", folders)
 	}
 }
 
