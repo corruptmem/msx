@@ -15,6 +15,10 @@ import (
 
 const root = "https://graph.microsoft.com/v1.0"
 
+var DefaultHTTPClient = func() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second}
+}
+
 type tokenRefresher interface {
 	RefreshIfNeeded(*store.Store, string, time.Duration) (store.Token, error)
 	ForceRefresh(*store.Store, string) (store.Token, error)
@@ -43,7 +47,7 @@ func (c Client) Request(method, path string, query map[string]string) (map[strin
 		c.BaseURL = root
 	}
 	if c.HTTPClient == nil {
-		c.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+		c.HTTPClient = DefaultHTTPClient()
 	}
 	if c.Auth == nil {
 		c.Auth = authRefresher{}
@@ -60,7 +64,7 @@ func (c Client) RequestURL(method, endpoint string) (map[string]any, error) {
 		c.BaseURL = root
 	}
 	if c.HTTPClient == nil {
-		c.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+		c.HTTPClient = DefaultHTTPClient()
 	}
 	if c.Auth == nil {
 		c.Auth = authRefresher{}

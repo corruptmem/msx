@@ -15,6 +15,7 @@ The design priority is not breadth. It is **auth durability**:
 ### Durable auth layer
 - **Device-code login** for new sign-ins
 - **1Password import** for existing Microsoft account setups
+- **JSON state export/import** for explicit profile backup and migration
 - Stores profile metadata + access token + refresh token in a single local embedded DB
 - Uses **bbolt** (transactional, crash-safe, single-writer, durable file-backed store)
 - Refreshes tokens **on demand** under a write transaction so concurrent callers do not stomp each other
@@ -30,8 +31,8 @@ The design priority is not breadth. It is **auth durability**:
 - `event-get` for one calendar event by id
 - `files` for OneDrive listing/search
 - `file-get` for one OneDrive item by id
-- `contacts` supports display-name and email-prefix matching, but may need extra Graph consent beyond the baseline app setup
-- `sites` command is present for SharePoint/org search, but likewise needs extra consent if the profile was imported with baseline scopes only
+- `contacts` supports display-name and email-prefix matching, and `contact-get` fetches one contact in detail (may need extra Graph consent beyond the baseline app setup)
+- `sites` supports SharePoint/org search, and `site-get` fetches one site record in detail (likewise needs extra consent if the profile was imported with baseline scopes only)
 - `next` to continue any returned `@odata.nextLink`
 - `profiles`
 
@@ -47,12 +48,19 @@ Go gives us:
 
 ## Install
 
-For normal dogfooding/use, install the latest official GitHub Actions artifact into a local `bin/` folder:
+For normal dogfooding/use, install the latest successful official GitHub Actions artifact into a local `bin/` folder:
 
 ```bash
 ./scripts/install-from-github-actions.sh ./bin
+./bin/msx version
 ./bin/msx --profile personal whoami
 ```
+
+The installer now:
+- downloads the platform-specific packaged artifact from `package.yml`
+- downloads the matching `SHA256SUMS` artifact from the same workflow run
+- verifies the archive checksum before unpacking
+- prints the installed binary's embedded provenance via `msx version`
 
 For local development only, you can still build directly:
 
@@ -81,6 +89,12 @@ Stored per profile:
 - expiry timestamp
 - obtained timestamp
 - raw token payload
+
+Backup/export format:
+- JSON with explicit `schema` and `version` markers
+- one file can hold one profile or multiple profiles
+- exported payload includes the full stored profile record plus access token, refresh token, and raw token payload
+- designed to be inspectable, diffable, and safe to move between machines
 
 ### Why bbolt?
 
@@ -129,11 +143,56 @@ msx whoami --profile personal
 msx login --profile personal --client-id YOUR_APP_ID --authority common
 ```
 
+### Version / provenance
+
+```bash
+msx version
+```
+
+Returns build metadata including the embedded version string, commit SHA, and build timestamp.
+
+For workflow artifacts:
+- tagged builds report the tag as `version`
+- non-tagged main-branch builds currently report `dev` plus the exact commit SHA
+- GitHub Releases are intentionally not part of the flow yet; official private-dogfood packages remain GitHub Actions artifacts for now
+
 ### Profiles
 
 ```bash
 msx profiles
 ```
+
+### State backup / migration
+
+Export the currently selected profile to stdout:
+
+```bash
+msx --profile personal state-export > personal-msx-state.json
+```
+
+Export all configured profiles to a file atomically:
+
+```bash
+msx state-export --all --out ./backups/msx-state.json
+```
+
+Import from a backup file:
+
+```bash
+msx state-import --in ./backups/msx-state.json
+```
+
+If the backup contains a profile name that already exists locally, import refuses to overwrite it by default. You must opt in explicitly:
+
+```bash
+msx state-import --in ./backups/msx-state.json --overwrite
+```
+
+Notes:
+- `state-export` defaults to the selected `--profile`; use `--all` to include every profile in the local store
+- `state-import` accepts one-profile or multi-profile backup files
+- import validates the whole backup before writing and restores profile+token state together in one DB transaction
+- output/input path `-` means stdout/stdin
 
 ### Mail search
 
@@ -170,12 +229,14 @@ msx file-get --profile personal 01ABCDEF234567890 --format json
 msx contacts --profile personal --top 20
 msx contacts --profile personal --query ali
 msx contacts --profile personal --query alice@example.com
+msx contact-get --profile personal AAMkAG...
 ```
 
 ### SharePoint / org sites
 
 ```bash
 msx sites --profile hexlium --query hexlium
+msx site-get --profile hexlium contoso.sharepoint.com,1234abcd-0000-1111-2222-abcdefabcdef,9876dcba-3333-4444-5555-fedcbafedcba
 ```
 
 ### Pagination continuation
@@ -202,7 +263,15 @@ That is deliberate:
 - agents can pass values through without lossy remapping
 - `@odata.nextLink` and similar fields remain available when Graph returns them
 
-`--format text` currently prints pretty JSON rather than a bespoke table renderer. That is honest, boring, and easy to diff. If a real text renderer is added later, it should be command-specific and tested.
+`--format text` is now command-specific for the highest-value human read paths:
+- `version`
+- `profiles`
+- `whoami`
+- `mail`
+- `agenda`
+- `files`
+
+Everything else still falls back to pretty JSON instead of inventing a lossy generic schema.
 
 ## Agent ergonomics
 
@@ -212,7 +281,7 @@ Current choices made for agent use:
 - JSON output by default
 - stable subcommands and flags
 - explicit range flags for agenda
-- direct detail-fetch commands for messages/events/files
+- direct detail-fetch commands for messages/events/files/contacts/sites
 - next-page continuation via raw `@odata.nextLink` instead of inventing opaque cursors
 - query flags rather than interactive prompts
 - profile selection is explicit and cheap
@@ -244,14 +313,14 @@ Covered areas now include:
 - forced refresh persistence
 - Graph `401` retry behavior and search headers
 - CLI global flag parsing, help-path behavior, next-link validation, and filtering helpers for mail/events/files
-- integration-style command tests for detail fetch and next-page continuation against a stub Graph server
+- integration-style command tests for detail fetch (mail/contacts/sites) and next-page continuation against a stub Graph server
 - output-shape checks that preserve top-level Graph fields like `@odata.nextLink` while applying client-side filters
 
 ## CI and packaging
 
 GitHub Actions now provides two lanes:
 - `ci.yml` runs `gofmt -l .`, `go vet ./...`, `go test ./...`, `go build ./cmd/msx`, and `go test -race ./...` with matrix coverage on Ubuntu, macOS, and Windows
-- `package.yml` builds official archives for Linux/macOS/Windows, uploads per-platform artifacts, and publishes a `SHA256SUMS` artifact for verification
+- `package.yml` builds official archives for Linux/macOS/Windows, stamps the binary with version/commit/build-date metadata, uploads per-platform artifacts, and publishes a `SHA256SUMS` artifact for verification
 
 Local dogfooding should prefer those packaged artifacts over ad-hoc local builds.
 

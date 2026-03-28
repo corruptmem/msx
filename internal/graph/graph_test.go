@@ -1,9 +1,10 @@
 package graph
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -34,6 +35,20 @@ func (s *stubAuth) ForceRefresh(_ *store.Store, _ string) (store.Token, error) {
 	return store.Token{AccessToken: s.activeToken, RefreshToken: "rt2", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour).Unix()}, nil
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
+
+func jsonResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewBufferString(body)),
+	}
+}
+
 func TestRequestForcesRefreshOnUnauthorized(t *testing.T) {
 	s, err := store.Open(filepath.Join(t.TempDir(), "db"))
 	if err != nil {
@@ -46,18 +61,19 @@ func TestRequestForcesRefreshOnUnauthorized(t *testing.T) {
 
 	auth := &stubAuth{activeToken: "stale-token"}
 	var seen []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen = append(seen, r.Header.Get("Authorization"))
-		if r.Header.Get("Authorization") == "Bearer stale-token" {
-			http.Error(w, `{"error":"expired"}`, http.StatusUnauthorized)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
-	defer server.Close()
-
-	client := Client{Store: s, Profile: "p", BaseURL: server.URL, HTTPClient: server.Client(), Auth: auth}
+	client := Client{
+		Store:   s,
+		Profile: "p",
+		BaseURL: "https://graph.example.test",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			seen = append(seen, r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") == "Bearer stale-token" {
+				return jsonResponse(http.StatusUnauthorized, `{"error":"expired"}`), nil
+			}
+			return jsonResponse(http.StatusOK, `{"ok":true}`), nil
+		})},
+		Auth: auth,
+	}
 	resp, err := client.Request(http.MethodGet, "/me", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -84,15 +100,18 @@ func TestRequestAddsConsistencyHeaderForSearch(t *testing.T) {
 	}
 
 	auth := &stubAuth{activeToken: "token"}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("ConsistencyLevel"); got != "eventual" {
-			t.Fatalf("expected ConsistencyLevel eventual, got %q", got)
-		}
-		_, _ = w.Write([]byte(`{"value":[]}`))
-	}))
-	defer server.Close()
-
-	client := Client{Store: s, Profile: "p", BaseURL: server.URL, HTTPClient: server.Client(), Auth: auth}
+	client := Client{
+		Store:   s,
+		Profile: "p",
+		BaseURL: "https://graph.example.test",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if got := r.Header.Get("ConsistencyLevel"); got != "eventual" {
+				t.Fatalf("expected ConsistencyLevel eventual, got %q", got)
+			}
+			return jsonResponse(http.StatusOK, `{"value":[]}`), nil
+		})},
+		Auth: auth,
+	}
 	if _, err := client.Request(http.MethodGet, "/me/messages", map[string]string{"$search": `"invoice"`}); err != nil {
 		t.Fatal(err)
 	}
@@ -109,16 +128,19 @@ func TestRequestURLAddsConsistencyHeaderForSearchNextLink(t *testing.T) {
 	}
 
 	auth := &stubAuth{activeToken: "token"}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("ConsistencyLevel"); got != "eventual" {
-			t.Fatalf("expected ConsistencyLevel eventual, got %q", got)
-		}
-		_, _ = w.Write([]byte(`{"value":[]}`))
-	}))
-	defer server.Close()
-
-	client := Client{Store: s, Profile: "p", BaseURL: server.URL, HTTPClient: server.Client(), Auth: auth}
-	if _, err := client.RequestURL(http.MethodGet, server.URL+`/me/messages?$search=%22invoice%22&$skiptoken=abc`); err != nil {
+	client := Client{
+		Store:   s,
+		Profile: "p",
+		BaseURL: "https://graph.example.test",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if got := r.Header.Get("ConsistencyLevel"); got != "eventual" {
+				t.Fatalf("expected ConsistencyLevel eventual, got %q", got)
+			}
+			return jsonResponse(http.StatusOK, `{"value":[]}`), nil
+		})},
+		Auth: auth,
+	}
+	if _, err := client.RequestURL(http.MethodGet, `https://graph.microsoft.com/v1.0/me/messages?$search=%22invoice%22&$skiptoken=abc`); err != nil {
 		t.Fatal(err)
 	}
 }

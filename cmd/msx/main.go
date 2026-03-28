@@ -5,8 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -21,13 +23,21 @@ type globalFlags struct {
 	format  string
 }
 
-var errHelpShown = errors.New("help shown")
+var (
+	errHelpShown = errors.New("help shown")
+	version      = "dev"
+	commit       = "unknown"
+	buildDate    = "unknown"
+)
 
 const usageText = `usage: msx [--profile name] [--format text|json] <command> [flags]
 
 commands:
   login         Start device-code login and save tokens locally
   import-op     Import an existing Microsoft account from 1Password
+  state-export  Export one or all local profiles as JSON backup
+  state-import  Import profile state from a JSON backup
+  version       Show CLI version/build provenance
   profiles      List configured profiles
   whoami        Show the current Graph account
   mail          List mail with optional filters
@@ -37,7 +47,9 @@ commands:
   files         List or search OneDrive files
   file-get      Fetch one OneDrive item by id
   contacts      List or search contacts
+  contact-get   Fetch one contact by id
   sites         Search SharePoint / org sites
+  site-get      Fetch one site by id
   next          Continue from a returned @odata.nextLink URL
   help          Show this message
 `
@@ -77,6 +89,12 @@ func run(args []string) error {
 		return cmdLogin(s, g, rest)
 	case "import-op":
 		return cmdImportOP(s, g, rest)
+	case "state-export":
+		return cmdStateExport(s, g, rest)
+	case "state-import":
+		return cmdStateImport(s, g, rest)
+	case "version":
+		return cmdVersion(g, rest)
 	case "profiles":
 		return cmdProfiles(s, g, rest)
 	case "whoami":
@@ -95,8 +113,12 @@ func run(args []string) error {
 		return cmdFileGet(s, g, rest)
 	case "contacts":
 		return cmdContacts(s, g, rest)
+	case "contact-get":
+		return cmdContactGet(s, g, rest)
 	case "sites":
 		return cmdSites(s, g, rest)
+	case "site-get":
+		return cmdSiteGet(s, g, rest)
 	case "next":
 		return cmdNext(s, g, rest)
 	default:
@@ -176,7 +198,7 @@ func cmdLogin(s *store.Store, g globalFlags, args []string) error {
 	if err := s.SaveProfileAndToken(profile, token); err != nil {
 		return err
 	}
-	return emit(g, map[string]any{"ok": true, "profile": g.profile, "authority": *authority})
+	return emit(g, "login", map[string]any{"ok": true, "profile": g.profile, "authority": *authority})
 }
 
 func cmdImportOP(s *store.Store, g globalFlags, args []string) error {
@@ -194,7 +216,94 @@ func cmdImportOP(s *store.Store, g globalFlags, args []string) error {
 	if err := auth.ImportFrom1Password(s, g.profile, *accountItem, *appItem, *vault, splitCSV(*scopesRaw)); err != nil {
 		return err
 	}
-	return emit(g, map[string]any{"ok": true, "profile": g.profile, "source": "1password", "account_item": *accountItem})
+	return emit(g, "import-op", map[string]any{"ok": true, "profile": g.profile, "source": "1password", "account_item": *accountItem})
+}
+
+func cmdStateExport(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("state-export", flag.ContinueOnError)
+	all := fs.Bool("all", false, "export all configured profiles")
+	outPath := fs.String("out", "-", "output path, or - for stdout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: msx state-export [--all] [--out path|-]")
+	}
+	var (
+		backup store.StateBackup
+		err    error
+	)
+	if *all {
+		backup, err = s.ExportAllProfiles()
+	} else {
+		backup, err = s.ExportProfile(g.profile)
+	}
+	if err != nil {
+		return err
+	}
+	payload, err := store.MarshalStateBackup(backup)
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	if *outPath == "-" {
+		_, err = os.Stdout.Write(payload)
+		return err
+	}
+	if err := writeFileAtomically(*outPath, payload, 0o600); err != nil {
+		return err
+	}
+	return emit(g, "state-export", map[string]any{
+		"ok":       true,
+		"path":     *outPath,
+		"count":    len(backup.Profiles),
+		"profiles": backupProfileNames(backup),
+	})
+}
+
+func cmdStateImport(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("state-import", flag.ContinueOnError)
+	inPath := fs.String("in", "-", "input path, or - for stdin")
+	overwrite := fs.Bool("overwrite", false, "overwrite existing profiles from the backup")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: msx state-import [--in path|-] [--overwrite]")
+	}
+	payload, err := readInput(*inPath)
+	if err != nil {
+		return err
+	}
+	backup, err := store.ParseStateBackup(payload)
+	if err != nil {
+		return err
+	}
+	if err := s.ImportStateBackup(backup, *overwrite); err != nil {
+		return err
+	}
+	return emit(g, "state-import", map[string]any{
+		"ok":        true,
+		"source":    *inPath,
+		"count":     len(backup.Profiles),
+		"profiles":  backupProfileNames(backup),
+		"overwrite": *overwrite,
+	})
+}
+
+func cmdVersion(g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: msx version")
+	}
+	return emit(g, "version", map[string]any{
+		"version":    version,
+		"commit":     commit,
+		"build_date": buildDate,
+	})
 }
 
 func cmdProfiles(s *store.Store, g globalFlags, _ []string) error {
@@ -214,7 +323,7 @@ func cmdProfiles(s *store.Store, g globalFlags, _ []string) error {
 			"expires_at":    tok.ExpiresAt,
 		})
 	}
-	return emit(g, rows)
+	return emit(g, "profiles", rows)
 }
 
 func cmdWhoami(s *store.Store, g globalFlags, _ []string) error {
@@ -222,7 +331,7 @@ func cmdWhoami(s *store.Store, g globalFlags, _ []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "whoami", data)
 }
 
 func cmdMail(s *store.Store, g globalFlags, args []string) error {
@@ -282,7 +391,7 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	if *subject != "" {
 		data["value"] = filterMailBySubject(data["value"], *subject)
 	}
-	return emit(g, data)
+	return emit(g, "mail", data)
 }
 
 func cmdMailGet(s *store.Store, g globalFlags, args []string) error {
@@ -302,7 +411,7 @@ func cmdMailGet(s *store.Store, g globalFlags, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "mail-get", data)
 }
 
 func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
@@ -353,7 +462,7 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	if *query != "" {
 		data["value"] = filterEvents(data["value"], *query)
 	}
-	return emit(g, data)
+	return emit(g, "agenda", data)
 }
 
 func cmdEventGet(s *store.Store, g globalFlags, args []string) error {
@@ -373,7 +482,7 @@ func cmdEventGet(s *store.Store, g globalFlags, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "event-get", data)
 }
 
 func cmdFiles(s *store.Store, g globalFlags, args []string) error {
@@ -417,7 +526,7 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	if *kind != "all" {
 		data["value"] = filterDriveItems(data["value"], *kind)
 	}
-	return emit(g, data)
+	return emit(g, "files", data)
 }
 
 func cmdFileGet(s *store.Store, g globalFlags, args []string) error {
@@ -432,7 +541,7 @@ func cmdFileGet(s *store.Store, g globalFlags, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "file-get", data)
 }
 
 func cmdContacts(s *store.Store, g globalFlags, args []string) error {
@@ -466,7 +575,22 @@ func cmdContacts(s *store.Store, g globalFlags, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "contacts", data)
+}
+
+func cmdContactGet(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("contact-get", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx contact-get <contact-id>")
+	}
+	data, err := newGraphClient(s, g.profile).Request("GET", "/me/contacts/"+url.PathEscape(fs.Arg(0)), map[string]string{"$select": "id,displayName,givenName,surname,companyName,jobTitle,emailAddresses,businessPhones,homePhones,mobilePhone,officeLocation,birthday,personalNotes,categories,imAddresses,homeAddress,businessAddress,otherAddress,parentFolderId,createdDateTime,lastModifiedDateTime"})
+	if err != nil {
+		return err
+	}
+	return emit(g, "contact-get", data)
 }
 
 func cmdSites(s *store.Store, g globalFlags, args []string) error {
@@ -498,7 +622,22 @@ func cmdSites(s *store.Store, g globalFlags, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "sites", data)
+}
+
+func cmdSiteGet(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("site-get", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx site-get <site-id>")
+	}
+	data, err := newGraphClient(s, g.profile).Request("GET", "/sites/"+url.PathEscape(fs.Arg(0)), map[string]string{"$select": "id,name,displayName,description,webUrl,createdDateTime,lastModifiedDateTime,sharepointIds,siteCollection,root,parentReference"})
+	if err != nil {
+		return err
+	}
+	return emit(g, "site-get", data)
 }
 
 func cmdNext(s *store.Store, g globalFlags, args []string) error {
@@ -517,7 +656,7 @@ func cmdNext(s *store.Store, g globalFlags, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(g, data)
+	return emit(g, "next", data)
 }
 
 func newGraphClient(s *store.Store, profile string) graph.Client {
@@ -528,11 +667,15 @@ func newGraphClient(s *store.Store, profile string) graph.Client {
 	return client
 }
 
-func emit(g globalFlags, v any) error {
+func emit(g globalFlags, command string, v any) error {
 	if g.format == "json" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(v)
+	}
+	if text, ok := renderText(command, v); ok {
+		_, err := fmt.Fprintln(os.Stdout, text)
+		return err
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -540,6 +683,231 @@ func emit(g globalFlags, v any) error {
 	}
 	_, err = fmt.Println(string(b))
 	return err
+}
+
+func renderText(command string, v any) (string, bool) {
+	switch command {
+	case "version":
+		row, ok := v.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		return fmt.Sprintf("version: %s\ncommit: %s\nbuild_date: %s", stringValue(row, "version"), stringValue(row, "commit"), stringValue(row, "build_date")), true
+	case "profiles":
+		rows, ok := v.([]map[string]any)
+		if !ok {
+			return "", false
+		}
+		if len(rows) == 0 {
+			return "no profiles configured", true
+		}
+		var b strings.Builder
+		for i, row := range rows {
+			if i > 0 {
+				b.WriteString("\n\n")
+			}
+			fmt.Fprintf(&b, "%s\n  authority: %s", stringValue(row, "name"), stringValue(row, "authority"))
+			if email := stringValue(row, "account_email"); email != "" {
+				fmt.Fprintf(&b, "\n  account: %s", email)
+			}
+			if scopes := stringSliceValue(row, "scopes"); len(scopes) > 0 {
+				fmt.Fprintf(&b, "\n  scopes: %s", strings.Join(scopes, ", "))
+			}
+			if expiresAt := int64Value(row, "expires_at"); expiresAt > 0 {
+				fmt.Fprintf(&b, "\n  expires: %s", time.Unix(expiresAt, 0).UTC().Format(time.RFC3339))
+			}
+		}
+		return b.String(), true
+	case "whoami":
+		row, ok := v.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		identity := firstNonEmpty(stringValue(row, "displayName"), stringValue(row, "userPrincipalName"), stringValue(row, "mail"))
+		secondary := firstNonEmpty(stringValue(row, "mail"), stringValue(row, "userPrincipalName"))
+		var b strings.Builder
+		b.WriteString(identity)
+		if secondary != "" && secondary != identity {
+			fmt.Fprintf(&b, "\nemail: %s", secondary)
+		}
+		for _, field := range []struct{ label, key string }{{"id", "id"}, {"job_title", "jobTitle"}, {"office", "officeLocation"}, {"mobile", "mobilePhone"}, {"preferred_language", "preferredLanguage"}} {
+			if value := stringValue(row, field.key); value != "" {
+				fmt.Fprintf(&b, "\n%s: %s", field.label, value)
+			}
+		}
+		return b.String(), true
+	case "mail":
+		return renderMailList(v)
+	case "agenda":
+		return renderAgendaList(v)
+	case "files":
+		return renderFilesList(v)
+	default:
+		return "", false
+	}
+}
+
+func renderMailList(v any) (string, bool) {
+	data, ok := v.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	items := filterRows(data["value"], func(map[string]any) bool { return true })
+	if len(items) == 0 {
+		return withNextLink("no messages", data), true
+	}
+	var b strings.Builder
+	for i, item := range items {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		status := "read"
+		if read, ok := item["isRead"].(bool); ok && !read {
+			status = "unread"
+		}
+		fmt.Fprintf(&b, "%d. [%s] %s  %s", i+1, status, stringValue(item, "receivedDateTime"), firstNonEmpty(stringValue(nestedMap(item, "from", "emailAddress"), "address"), "(unknown sender)"))
+		fmt.Fprintf(&b, "\n   %s", firstNonEmpty(stringValue(item, "subject"), "(no subject)"))
+		if link := stringValue(item, "webLink"); link != "" {
+			fmt.Fprintf(&b, "\n   %s", link)
+		}
+	}
+	return withNextLink(b.String(), data), true
+}
+
+func renderAgendaList(v any) (string, bool) {
+	data, ok := v.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	items := filterRows(data["value"], func(map[string]any) bool { return true })
+	if len(items) == 0 {
+		return withNextLink("no events", data), true
+	}
+	var b strings.Builder
+	for i, item := range items {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b, "%d. %s → %s  %s", i+1, stringValue(nestedMap(item, "start"), "dateTime"), stringValue(nestedMap(item, "end"), "dateTime"), firstNonEmpty(stringValue(item, "subject"), "(no subject)"))
+		if location := stringValue(nestedMap(item, "location"), "displayName"); location != "" {
+			fmt.Fprintf(&b, "\n   location: %s", location)
+		}
+		if organizer := stringValue(nestedMap(item, "organizer", "emailAddress"), "address"); organizer != "" {
+			fmt.Fprintf(&b, "\n   organizer: %s", organizer)
+		}
+		if link := stringValue(item, "webLink"); link != "" {
+			fmt.Fprintf(&b, "\n   %s", link)
+		}
+	}
+	return withNextLink(b.String(), data), true
+}
+
+func renderFilesList(v any) (string, bool) {
+	data, ok := v.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	items := filterRows(data["value"], func(map[string]any) bool { return true })
+	if len(items) == 0 {
+		return withNextLink("no files", data), true
+	}
+	var b strings.Builder
+	for i, item := range items {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		kind := "file"
+		if _, ok := item["folder"]; ok {
+			kind = "folder"
+		}
+		fmt.Fprintf(&b, "%d. [%s] %s", i+1, kind, firstNonEmpty(stringValue(item, "name"), "(unnamed)"))
+		if size, ok := item["size"]; ok {
+			fmt.Fprintf(&b, "\n   size: %v", size)
+		}
+		if modified := stringValue(item, "lastModifiedDateTime"); modified != "" {
+			fmt.Fprintf(&b, "\n   modified: %s", modified)
+		}
+		if parentPath := stringValue(nestedMap(item, "parentReference"), "path"); parentPath != "" {
+			fmt.Fprintf(&b, "\n   parent: %s", parentPath)
+		}
+		if link := stringValue(item, "webUrl"); link != "" {
+			fmt.Fprintf(&b, "\n   %s", link)
+		}
+	}
+	return withNextLink(b.String(), data), true
+}
+
+func withNextLink(body string, data map[string]any) string {
+	if next := stringValue(data, "@odata.nextLink"); next != "" {
+		return body + "\n\nnext: " + next
+	}
+	return body
+}
+
+func nestedMap(row map[string]any, keys ...string) map[string]any {
+	cur := row
+	for _, key := range keys {
+		value, ok := cur[key].(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = value
+	}
+	return cur
+}
+
+func stringValue(row map[string]any, key string) string {
+	if row == nil {
+		return ""
+	}
+	v, _ := row[key].(string)
+	return v
+}
+
+func stringSliceValue(row map[string]any, key string) []string {
+	if row == nil {
+		return nil
+	}
+	items, ok := row[key].([]string)
+	if ok {
+		return items
+	}
+	vals, ok := row[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(vals))
+	for _, item := range vals {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func int64Value(row map[string]any, key string) int64 {
+	if row == nil {
+		return 0
+	}
+	switch v := row[key].(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func splitCSV(v string) []string {
@@ -623,6 +991,61 @@ func filterRows(v any, keep func(map[string]any) bool) []map[string]any {
 func requirePositive(name string, v int) error {
 	if v <= 0 {
 		return fmt.Errorf("%s must be > 0", name)
+	}
+	return nil
+}
+
+func backupProfileNames(backup store.StateBackup) []string {
+	names := make([]string, 0, len(backup.Profiles))
+	for _, item := range backup.Profiles {
+		names = append(names, item.Profile.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func readInput(path string) ([]byte, error) {
+	if path == "-" {
+		return io.ReadAll(os.Stdin)
+	}
+	return os.ReadFile(path)
+}
+
+func writeFileAtomically(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	cleanup := func() {
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Chmod(perm); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		cleanup()
+		return err
 	}
 	return nil
 }

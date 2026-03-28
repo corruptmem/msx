@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/corruptmem/msx/internal/graph"
 	"github.com/corruptmem/msx/internal/store"
 )
 
@@ -39,6 +39,23 @@ func TestParseGlobalsRejectsInvalidFormat(t *testing.T) {
 func TestShowUsageHelpPath(t *testing.T) {
 	if err := showUsage(false, ""); !errors.Is(err, errHelpShown) {
 		t.Fatalf("expected errHelpShown, got %v", err)
+	}
+}
+
+func TestVersionCommandEmitsBuildMetadata(t *testing.T) {
+	t.Setenv("MSX_HOME", t.TempDir())
+	oldVersion, oldCommit, oldBuildDate := version, commit, buildDate
+	version, commit, buildDate = "v1.2.3", "abc123", "2026-03-28T13:00:00Z"
+	defer func() {
+		version, commit, buildDate = oldVersion, oldCommit, oldBuildDate
+	}()
+
+	stdout, stderr, err := captureRun([]string{"version"})
+	if err != nil {
+		t.Fatalf("version failed: %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"version": "v1.2.3"`) || !strings.Contains(stdout, `"commit": "abc123"`) || !strings.Contains(stdout, `"build_date": "2026-03-28T13:00:00Z"`) {
+		t.Fatalf("unexpected version stdout: %s", stdout)
 	}
 }
 
@@ -112,31 +129,39 @@ func TestValidateNextLink(t *testing.T) {
 	}
 }
 
-func TestRunMailGetAndNextAgainstTestServer(t *testing.T) {
+func TestRunDetailCommandsAndNextAgainstTestServer(t *testing.T) {
 	t.Setenv("MSX_HOME", t.TempDir())
 	t.Setenv("MSX_GRAPH_BASE_URL", "")
 	seedProfile(t, os.Getenv("MSX_HOME"), "personal")
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	withGraphHTTPClient(t, func(r *http.Request) (*http.Response, error) {
 		switch {
 		case r.URL.Path == "/v1.0/me/messages/msg-123":
 			if got := r.URL.Query().Get("$select"); !strings.Contains(got, "conversationId") {
-				t.Fatalf("expected detail select fields, got %q", got)
+				t.Fatalf("expected message detail select fields, got %q", got)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"id":"msg-123","subject":"hello"}`)
+			return jsonHTTPResponse(http.StatusOK, `{"id":"msg-123","subject":"hello"}`), nil
+		case r.URL.Path == "/v1.0/me/contacts/contact-123":
+			if got := r.URL.Query().Get("$select"); !strings.Contains(got, "emailAddresses") || !strings.Contains(got, "lastModifiedDateTime") {
+				t.Fatalf("expected contact detail select fields, got %q", got)
+			}
+			return jsonHTTPResponse(http.StatusOK, `{"id":"contact-123","displayName":"Alice"}`), nil
+		case r.URL.Path == "/v1.0/sites/site-123":
+			if got := r.URL.Query().Get("$select"); !strings.Contains(got, "sharepointIds") || !strings.Contains(got, "webUrl") {
+				t.Fatalf("expected site detail select fields, got %q", got)
+			}
+			return jsonHTTPResponse(http.StatusOK, `{"id":"site-123","displayName":"Docs"}`), nil
 		case r.URL.Path == "/v1.0/me/messages":
 			if got := r.URL.Query().Get("$skiptoken"); got != "abc" {
 				t.Fatalf("expected skiptoken abc, got %q", got)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"value":[{"id":"msg-2"}]}`)
+			return jsonHTTPResponse(http.StatusOK, `{"value":[{"id":"msg-2"}]}`), nil
 		default:
 			t.Fatalf("unexpected request path: %s", r.URL.String())
+			return nil, nil
 		}
-	}))
-	defer server.Close()
-	t.Setenv("MSX_GRAPH_BASE_URL", server.URL+"/v1.0")
+	})
+	t.Setenv("MSX_GRAPH_BASE_URL", "https://graph.example.test/v1.0")
 
 	stdout, stderr, err := captureRun([]string{"--profile", "personal", "mail-get", "msg-123"})
 	if err != nil {
@@ -144,6 +169,22 @@ func TestRunMailGetAndNextAgainstTestServer(t *testing.T) {
 	}
 	if !strings.Contains(stdout, `"id": "msg-123"`) {
 		t.Fatalf("unexpected mail-get stdout: %s", stdout)
+	}
+
+	stdout, stderr, err = captureRun([]string{"--profile", "personal", "contact-get", "contact-123"})
+	if err != nil {
+		t.Fatalf("contact-get failed: %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"id": "contact-123"`) {
+		t.Fatalf("unexpected contact-get stdout: %s", stdout)
+	}
+
+	stdout, stderr, err = captureRun([]string{"--profile", "personal", "site-get", "site-123"})
+	if err != nil {
+		t.Fatalf("site-get failed: %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"id": "site-123"`) {
+		t.Fatalf("unexpected site-get stdout: %s", stdout)
 	}
 
 	stdout, stderr, err = captureRun([]string{"--profile", "personal", "next", "--url", "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc"})
@@ -159,12 +200,10 @@ func TestRunMailSubjectFilterPreservesTopLevelShape(t *testing.T) {
 	t.Setenv("MSX_HOME", t.TempDir())
 	seedProfile(t, os.Getenv("MSX_HOME"), "personal")
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"@odata.nextLink":"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=abc","value":[{"id":"1","subject":"Invoice 1"},{"id":"2","subject":"Dinner"}]}`)
-	}))
-	defer server.Close()
-	t.Setenv("MSX_GRAPH_BASE_URL", server.URL+"/v1.0")
+	withGraphHTTPClient(t, func(r *http.Request) (*http.Response, error) {
+		return jsonHTTPResponse(http.StatusOK, `{"@odata.nextLink":"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=abc","value":[{"id":"1","subject":"Invoice 1"},{"id":"2","subject":"Dinner"}]}`), nil
+	})
+	t.Setenv("MSX_GRAPH_BASE_URL", "https://graph.example.test/v1.0")
 
 	stdout, stderr, err := captureRun([]string{"--profile", "personal", "mail", "--subject", "invoice"})
 	if err != nil {
@@ -180,6 +219,132 @@ func TestRunMailSubjectFilterPreservesTopLevelShape(t *testing.T) {
 	items, _ := got["value"].([]any)
 	if len(items) != 1 {
 		t.Fatalf("expected one filtered item, got %d", len(items))
+	}
+}
+
+func TestStateExportAndImportCommandsRoundTrip(t *testing.T) {
+	t.Setenv("MSX_HOME", t.TempDir())
+	seedProfile(t, os.Getenv("MSX_HOME"), "personal")
+
+	stdout, stderr, err := captureRun([]string{"--profile", "personal", "state-export"})
+	if err != nil {
+		t.Fatalf("state-export failed: %v stderr=%s", err, stderr)
+	}
+	backup, err := store.ParseStateBackup([]byte(stdout))
+	if err != nil {
+		t.Fatalf("state-export did not emit a valid backup: %v\n%s", err, stdout)
+	}
+	if len(backup.Profiles) != 1 || backup.Profiles[0].Profile.Name != "personal" {
+		t.Fatalf("unexpected export payload: %+v", backup)
+	}
+	if !jsonBlobEqual(backup.Profiles[0].Token.Raw, json.RawMessage(`{"ok":true}`)) {
+		t.Fatalf("raw token payload was not preserved: %s", string(backup.Profiles[0].Token.Raw))
+	}
+
+	importHome := t.TempDir()
+	backupPath := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(backupPath, []byte(stdout), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MSX_HOME", importHome)
+
+	stdout, stderr, err = captureRun([]string{"state-import", "--in", backupPath})
+	if err != nil {
+		t.Fatalf("state-import failed: %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"ok": true`) || !strings.Contains(stdout, `"count": 1`) {
+		t.Fatalf("unexpected state-import stdout: %s", stdout)
+	}
+
+	s, err := store.Open(importHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	gotProfile, err := s.GetProfile("personal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotToken, err := s.GetToken("personal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotProfile.ClientID != "cid" || gotToken.RefreshToken != "rt" {
+		t.Fatalf("unexpected restored state: %+v %+v", gotProfile, gotToken)
+	}
+}
+
+func TestStateImportCommandRefusesOverwriteWithoutFlag(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("MSX_HOME", home)
+	seedProfile(t, home, "personal")
+
+	backup := store.StateBackup{
+		Schema:  "msx-state-backup",
+		Version: 1,
+		Profiles: []store.StateBackupProfile{{
+			Profile: store.Profile{Name: "personal", Authority: "organizations", ClientID: "new"},
+			Token:   store.Token{AccessToken: "new-at", RefreshToken: "new-rt", TokenType: "Bearer", Raw: json.RawMessage(`{"new":true}`)},
+		}},
+	}
+	blob, err := store.MarshalStateBackup(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(backupPath, blob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, stderr, err := captureRun([]string{"state-import", "--in", backupPath}); err == nil {
+		t.Fatal("expected overwrite refusal")
+	} else if !strings.Contains(err.Error(), "already exists") && !strings.Contains(stderr, "already exists") {
+		t.Fatalf("unexpected error: %v stderr=%s", err, stderr)
+	}
+
+	s, err := store.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	gotProfile, err := s.GetProfile("personal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotProfile.ClientID != "cid" {
+		t.Fatalf("profile was overwritten unexpectedly: %+v", gotProfile)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, stderr, err := captureRun([]string{"state-import", "--in", backupPath, "--overwrite"}); err != nil {
+		t.Fatalf("overwrite import failed: %v stderr=%s", err, stderr)
+	}
+	s, err = store.Open(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	gotProfile, err = s.GetProfile("personal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotProfile.ClientID != "new" {
+		t.Fatalf("overwrite import did not apply: %+v", gotProfile)
+	}
+}
+
+func TestStateImportCommandRejectsMalformedBackup(t *testing.T) {
+	t.Setenv("MSX_HOME", t.TempDir())
+	backupPath := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(backupPath, []byte(`{"schema":"wrong","version":1,"profiles":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, err := captureRun([]string{"state-import", "--in", backupPath}); err == nil {
+		t.Fatal("expected malformed backup error")
+	} else if !strings.Contains(err.Error(), "unsupported state backup schema") && !strings.Contains(stderr, "unsupported state backup schema") {
+		t.Fatalf("unexpected error: %v stderr=%s", err, stderr)
 	}
 }
 
@@ -211,6 +376,43 @@ func captureRun(args []string) (stdout string, stderr string, err error) {
 	return string(outBytes), string(errBytes), runErr
 }
 
+func withGraphHTTPClient(t *testing.T, fn func(*http.Request) (*http.Response, error)) {
+	t.Helper()
+	old := graph.DefaultHTTPClient
+	graph.DefaultHTTPClient = func() *http.Client {
+		return &http.Client{Transport: roundTripFunc(fn)}
+	}
+	t.Cleanup(func() {
+		graph.DefaultHTTPClient = old
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return fn(r)
+}
+
+func jsonHTTPResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func jsonBlobEqual(a, b json.RawMessage) bool {
+	var left any
+	if err := json.Unmarshal(a, &left); err != nil {
+		return false
+	}
+	var right any
+	if err := json.Unmarshal(b, &right); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(left, right)
+}
+
 func seedProfile(t *testing.T, dir string, profile string) {
 	t.Helper()
 	s, err := store.Open(dir)
@@ -226,7 +428,7 @@ func seedProfile(t *testing.T, dir string, profile string) {
 	}
 }
 
-func TestEmitTextIsPrettyJSON(t *testing.T) {
+func TestEmitTextFallsBackToPrettyJSON(t *testing.T) {
 	oldStdout := os.Stdout
 	defer func() { os.Stdout = oldStdout }()
 
@@ -235,7 +437,7 @@ func TestEmitTextIsPrettyJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stdout = w
-	if err := emit(globalFlags{format: "text"}, map[string]any{"ok": true}); err != nil {
+	if err := emit(globalFlags{format: "text"}, "contacts", map[string]any{"ok": true}); err != nil {
 		t.Fatal(err)
 	}
 	_ = w.Close()
@@ -245,5 +447,46 @@ func TestEmitTextIsPrettyJSON(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), `"ok": true`) {
 		t.Fatalf("unexpected text output: %s", buf.String())
+	}
+}
+
+func TestRenderMailListText(t *testing.T) {
+	text, ok := renderText("mail", map[string]any{
+		"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc",
+		"value": []any{
+			map[string]any{
+				"subject":          "Invoice ready",
+				"receivedDateTime": "2026-03-28T12:00:00Z",
+				"isRead":           false,
+				"from":             map[string]any{"emailAddress": map[string]any{"address": "billing@example.com"}},
+				"webLink":          "https://outlook.office.com/mail/msg-1",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("expected renderer to handle mail")
+	}
+	for _, needle := range []string{"[unread]", "Invoice ready", "billing@example.com", "next: https://graph.microsoft.com"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("expected %q in output: %s", needle, text)
+		}
+	}
+}
+
+func TestRenderProfilesText(t *testing.T) {
+	text, ok := renderText("profiles", []map[string]any{{
+		"name":          "personal",
+		"authority":     "common",
+		"account_email": "cam@example.com",
+		"scopes":        []string{"User.Read", "Mail.ReadWrite"},
+		"expires_at":    float64(1774700000),
+	}})
+	if !ok {
+		t.Fatal("expected renderer to handle profiles")
+	}
+	for _, needle := range []string{"personal", "authority: common", "account: cam@example.com", "scopes: User.Read, Mail.ReadWrite", "expires: "} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("expected %q in output: %s", needle, text)
+		}
 	}
 }
