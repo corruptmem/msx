@@ -233,13 +233,16 @@ Tested against the existing configured accounts:
 - `MS Personal`: import, `whoami`, `mail`, `agenda`, `files`, mail search, file search
 - `MS Hexlium`: import, `whoami`, `mail`, `agenda`
 
-## What still remains to make it excellent
+## Current rough edges
 
-High-value next steps:
-- richer mail filtering (`subject`, pagination helpers, folder discovery)
-- contact lookup by exact email and broader consent-aware search
-- file metadata normalization for cleaner downstream indexing
+Still intentionally unfinished:
+- no write/mutation commands yet; the CLI is read-only outside auth flows
+- `--format text` is just pretty JSON, not a human-tuned renderer
+- there are no pagination helper commands yet; Graph pagination stays in the raw response
+- contacts and site search depend on the profile having the extra Graph consent they need
+
+Possible future work, if it earns its keep:
 - message/event/body detail fetch commands
-- OS keychain / age-backed optional encryption-at-rest for the DB
+- optional encryption-at-rest beyond filesystem permissions
 - backup/export/import tooling for state migration
-- command-specific text renderers if human-first output becomes a real priority
+- command-specific text renderers for human-first use
