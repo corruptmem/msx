@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -30,10 +31,14 @@ commands:
   profiles      List configured profiles
   whoami        Show the current Graph account
   mail          List mail with optional filters
+  mail-get      Fetch one mail message by id
   agenda        List calendar events in a time range
+  event-get     Fetch one calendar event by id
   files         List or search OneDrive files
+  file-get      Fetch one OneDrive item by id
   contacts      List or search contacts
   sites         Search SharePoint / org sites
+  next          Continue from a returned @odata.nextLink URL
   help          Show this message
 `
 
@@ -78,14 +83,22 @@ func run(args []string) error {
 		return cmdWhoami(s, g, rest)
 	case "mail":
 		return cmdMail(s, g, rest)
+	case "mail-get":
+		return cmdMailGet(s, g, rest)
 	case "agenda":
 		return cmdAgenda(s, g, rest)
+	case "event-get":
+		return cmdEventGet(s, g, rest)
 	case "files":
 		return cmdFiles(s, g, rest)
+	case "file-get":
+		return cmdFileGet(s, g, rest)
 	case "contacts":
 		return cmdContacts(s, g, rest)
 	case "sites":
 		return cmdSites(s, g, rest)
+	case "next":
+		return cmdNext(s, g, rest)
 	default:
 		return showUsage(true, fmt.Sprintf("unknown command %q", cmd))
 	}
@@ -205,7 +218,7 @@ func cmdProfiles(s *store.Store, g globalFlags, _ []string) error {
 }
 
 func cmdWhoami(s *store.Store, g globalFlags, _ []string) error {
-	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", "/me", nil)
+	data, err := newGraphClient(s, g.profile).Request("GET", "/me", nil)
 	if err != nil {
 		return err
 	}
@@ -221,41 +234,73 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	since := fs.String("since", "", "received since RFC3339 timestamp")
 	folder := fs.String("folder", "inbox", "well-known mail folder or folder id")
 	unread := fs.Bool("unread", false, "only include unread messages")
+	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
-	path := fmt.Sprintf("/me/mailFolders/%s/messages", *folder)
-	q := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,subject,receivedDateTime,from,isRead,webLink"}
-	filters := []string{}
-	if *sender != "" {
-		filters = append(filters, fmt.Sprintf("from/emailAddress/address eq '%s'", strings.ReplaceAll(*sender, "'", "''")))
-	}
-	if *since != "" {
-		if _, err := time.Parse(time.RFC3339, *since); err != nil {
-			return fmt.Errorf("invalid --since, want RFC3339: %w", err)
+	var (
+		data map[string]any
+		err  error
+	)
+	if *nextLink != "" {
+		if err := validateNextLink(*nextLink); err != nil {
+			return err
 		}
-		filters = append(filters, fmt.Sprintf("receivedDateTime ge %s", *since))
-	}
-	if *unread {
-		filters = append(filters, "isRead eq false")
-	}
-	if len(filters) > 0 {
-		q["$filter"] = strings.Join(filters, " and ")
-	}
-	if *query != "" {
-		q["$search"] = fmt.Sprintf("\"%s\"", *query)
+		data, err = newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
 	} else {
-		q["$orderby"] = "receivedDateTime desc"
+		path := fmt.Sprintf("/me/mailFolders/%s/messages", *folder)
+		q := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,subject,receivedDateTime,from,isRead,webLink"}
+		filters := []string{}
+		if *sender != "" {
+			filters = append(filters, fmt.Sprintf("from/emailAddress/address eq '%s'", strings.ReplaceAll(*sender, "'", "''")))
+		}
+		if *since != "" {
+			if _, err := time.Parse(time.RFC3339, *since); err != nil {
+				return fmt.Errorf("invalid --since, want RFC3339: %w", err)
+			}
+			filters = append(filters, fmt.Sprintf("receivedDateTime ge %s", *since))
+		}
+		if *unread {
+			filters = append(filters, "isRead eq false")
+		}
+		if len(filters) > 0 {
+			q["$filter"] = strings.Join(filters, " and ")
+		}
+		if *query != "" {
+			q["$search"] = fmt.Sprintf("\"%s\"", *query)
+		} else {
+			q["$orderby"] = "receivedDateTime desc"
+		}
+		data, err = newGraphClient(s, g.profile).Request("GET", path, q)
 	}
-	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", path, q)
 	if err != nil {
 		return err
 	}
 	if *subject != "" {
 		data["value"] = filterMailBySubject(data["value"], *subject)
+	}
+	return emit(g, data)
+}
+
+func cmdMailGet(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("mail-get", flag.ContinueOnError)
+	body := fs.Bool("body", false, "include body and bodyPreview fields")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx mail-get [--body] <message-id>")
+	}
+	selectFields := []string{"id", "subject", "receivedDateTime", "sentDateTime", "from", "toRecipients", "ccRecipients", "bccRecipients", "isRead", "conversationId", "hasAttachments", "importance", "webLink"}
+	if *body {
+		selectFields = append(selectFields, "bodyPreview", "body")
+	}
+	data, err := newGraphClient(s, g.profile).Request("GET", "/me/messages/"+url.PathEscape(fs.Arg(0)), map[string]string{"$select": strings.Join(selectFields, ",")})
+	if err != nil {
+		return err
 	}
 	return emit(g, data)
 }
@@ -266,35 +311,67 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	start := fs.String("start", time.Now().UTC().Format(time.RFC3339), "range start RFC3339")
 	end := fs.String("end", time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339), "range end RFC3339")
 	query := fs.String("query", "", "search text applied client-side to subject/location/organizer")
+	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
-	startTime, err := time.Parse(time.RFC3339, *start)
-	if err != nil {
-		return fmt.Errorf("invalid --start, want RFC3339: %w", err)
+	var (
+		data map[string]any
+		err  error
+	)
+	if *nextLink != "" {
+		if err := validateNextLink(*nextLink); err != nil {
+			return err
+		}
+		data, err = newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
+	} else {
+		startTime, err := time.Parse(time.RFC3339, *start)
+		if err != nil {
+			return fmt.Errorf("invalid --start, want RFC3339: %w", err)
+		}
+		endTime, err := time.Parse(time.RFC3339, *end)
+		if err != nil {
+			return fmt.Errorf("invalid --end, want RFC3339: %w", err)
+		}
+		if !endTime.After(startTime) {
+			return fmt.Errorf("--end must be after --start")
+		}
+		data, err = newGraphClient(s, g.profile).Request("GET", "/me/calendarView", map[string]string{
+			"startDateTime": *start,
+			"endDateTime":   *end,
+			"$top":          fmt.Sprint(*top),
+			"$orderby":      "start/dateTime",
+			"$select":       "id,subject,start,end,location,organizer,webLink",
+		})
 	}
-	endTime, err := time.Parse(time.RFC3339, *end)
-	if err != nil {
-		return fmt.Errorf("invalid --end, want RFC3339: %w", err)
-	}
-	if !endTime.After(startTime) {
-		return fmt.Errorf("--end must be after --start")
-	}
-	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", "/me/calendarView", map[string]string{
-		"startDateTime": *start,
-		"endDateTime":   *end,
-		"$top":          fmt.Sprint(*top),
-		"$orderby":      "start/dateTime",
-		"$select":       "id,subject,start,end,location,organizer,webLink",
-	})
 	if err != nil {
 		return err
 	}
 	if *query != "" {
 		data["value"] = filterEvents(data["value"], *query)
+	}
+	return emit(g, data)
+}
+
+func cmdEventGet(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("event-get", flag.ContinueOnError)
+	body := fs.Bool("body", false, "include body and bodyPreview fields")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx event-get [--body] <event-id>")
+	}
+	selectFields := []string{"id", "subject", "start", "end", "location", "locations", "organizer", "attendees", "isAllDay", "showAs", "sensitivity", "webLink", "onlineMeeting", "onlineMeetingUrl"}
+	if *body {
+		selectFields = append(selectFields, "bodyPreview", "body")
+	}
+	data, err := newGraphClient(s, g.profile).Request("GET", "/me/events/"+url.PathEscape(fs.Arg(0)), map[string]string{"$select": strings.Join(selectFields, ",")})
+	if err != nil {
+		return err
 	}
 	return emit(g, data)
 }
@@ -305,6 +382,7 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	path := fs.String("path", "", "folder path to list")
 	query := fs.String("query", "", "search query")
 	kind := fs.String("kind", "all", "all|files|folders")
+	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -314,14 +392,25 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	if *kind != "all" && *kind != "files" && *kind != "folders" {
 		return fmt.Errorf("--kind must be all, files, or folders")
 	}
-	endpoint := "/me/drive/root/children"
-	params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,name,webUrl,file,folder,size,lastModifiedDateTime,parentReference"}
-	if *query != "" {
-		endpoint = fmt.Sprintf("/me/drive/root/search(q='%s')", escapePathSegment(*query))
-	} else if *path != "" {
-		endpoint = fmt.Sprintf("/me/drive/root:/%s:/children", strings.TrimPrefix(*path, "/"))
+	var (
+		data map[string]any
+		err  error
+	)
+	if *nextLink != "" {
+		if err := validateNextLink(*nextLink); err != nil {
+			return err
+		}
+		data, err = newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
+	} else {
+		endpoint := "/me/drive/root/children"
+		params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,name,webUrl,file,folder,size,lastModifiedDateTime,parentReference"}
+		if *query != "" {
+			endpoint = fmt.Sprintf("/me/drive/root/search(q='%s')", escapePathSegment(*query))
+		} else if *path != "" {
+			endpoint = fmt.Sprintf("/me/drive/root:/%s:/children", strings.TrimPrefix(*path, "/"))
+		}
+		data, err = newGraphClient(s, g.profile).Request("GET", endpoint, params)
 	}
-	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", endpoint, params)
 	if err != nil {
 		return err
 	}
@@ -331,22 +420,49 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	return emit(g, data)
 }
 
+func cmdFileGet(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("file-get", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx file-get <drive-item-id>")
+	}
+	data, err := newGraphClient(s, g.profile).Request("GET", "/me/drive/items/"+url.PathEscape(fs.Arg(0)), map[string]string{"$select": "id,name,webUrl,file,folder,size,lastModifiedDateTime,createdDateTime,parentReference,shared,fileSystemInfo,@microsoft.graph.downloadUrl"})
+	if err != nil {
+		return err
+	}
+	return emit(g, data)
+}
+
 func cmdContacts(s *store.Store, g globalFlags, args []string) error {
 	fs := flag.NewFlagSet("contacts", flag.ContinueOnError)
 	top := fs.Int("top", 20, "maximum number of contacts")
 	query := fs.String("query", "", "display name/email prefix filter")
+	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
-	params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,displayName,emailAddresses,mobilePhone,businessPhones", "$orderby": "displayName"}
-	if *query != "" {
-		safe := strings.ReplaceAll(*query, "'", "''")
-		params["$filter"] = fmt.Sprintf("startswith(displayName,'%s') or emailAddresses/any(e:startswith(e/address,'%s'))", safe, safe)
+	var (
+		data map[string]any
+		err  error
+	)
+	if *nextLink != "" {
+		if err := validateNextLink(*nextLink); err != nil {
+			return err
+		}
+		data, err = newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
+	} else {
+		params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,displayName,emailAddresses,mobilePhone,businessPhones", "$orderby": "displayName"}
+		if *query != "" {
+			safe := strings.ReplaceAll(*query, "'", "''")
+			params["$filter"] = fmt.Sprintf("startswith(displayName,'%s') or emailAddresses/any(e:startswith(e/address,'%s'))", safe, safe)
+		}
+		data, err = newGraphClient(s, g.profile).Request("GET", "/me/contacts", params)
 	}
-	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", "/me/contacts", params)
 	if err != nil {
 		return err
 	}
@@ -357,20 +473,59 @@ func cmdSites(s *store.Store, g globalFlags, args []string) error {
 	fs := flag.NewFlagSet("sites", flag.ContinueOnError)
 	top := fs.Int("top", 10, "maximum number of sites")
 	query := fs.String("query", "", "site search query")
+	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
-	if *query == "" {
-		return fmt.Errorf("--query is required")
+	var (
+		data map[string]any
+		err  error
+	)
+	if *nextLink != "" {
+		if err := validateNextLink(*nextLink); err != nil {
+			return err
+		}
+		data, err = newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
+	} else {
+		if *query == "" {
+			return fmt.Errorf("--query is required")
+		}
+		data, err = newGraphClient(s, g.profile).Request("GET", "/sites", map[string]string{"search": *query, "$top": fmt.Sprint(*top)})
 	}
-	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", "/sites", map[string]string{"search": *query, "$top": fmt.Sprint(*top)})
 	if err != nil {
 		return err
 	}
 	return emit(g, data)
+}
+
+func cmdNext(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("next", flag.ContinueOnError)
+	nextLink := fs.String("url", "", "the @odata.nextLink URL to fetch")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *nextLink == "" {
+		return fmt.Errorf("--url is required")
+	}
+	if err := validateNextLink(*nextLink); err != nil {
+		return err
+	}
+	data, err := newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
+	if err != nil {
+		return err
+	}
+	return emit(g, data)
+}
+
+func newGraphClient(s *store.Store, profile string) graph.Client {
+	client := graph.Client{Store: s, Profile: profile}
+	if baseURL := os.Getenv("MSX_GRAPH_BASE_URL"); baseURL != "" {
+		client.BaseURL = strings.TrimRight(baseURL, "/")
+	}
+	return client
 }
 
 func emit(g globalFlags, v any) error {
@@ -401,6 +556,20 @@ func splitCSV(v string) []string {
 
 func escapePathSegment(v string) string {
 	return strings.ReplaceAll(v, "'", "''")
+}
+
+func validateNextLink(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid --next-link URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("--next-link must use https")
+	}
+	if !strings.EqualFold(u.Host, "graph.microsoft.com") {
+		return fmt.Errorf("--next-link host must be graph.microsoft.com")
+	}
+	return nil
 }
 
 func filterMailBySubject(v any, q string) []map[string]any {

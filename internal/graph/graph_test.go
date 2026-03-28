@@ -97,3 +97,28 @@ func TestRequestAddsConsistencyHeaderForSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRequestURLAddsConsistencyHeaderForSearchNextLink(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.SaveProfileAndToken(store.Profile{Name: "p", Authority: "common", ClientID: "cid", Scopes: []string{"User.Read"}}, store.Token{AccessToken: "token", RefreshToken: "rt", TokenType: "Bearer", ExpiresAt: time.Now().Add(time.Hour).Unix(), Raw: json.RawMessage(`{"ok":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+
+	auth := &stubAuth{activeToken: "token"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("ConsistencyLevel"); got != "eventual" {
+			t.Fatalf("expected ConsistencyLevel eventual, got %q", got)
+		}
+		_, _ = w.Write([]byte(`{"value":[]}`))
+	}))
+	defer server.Close()
+
+	client := Client{Store: s, Profile: "p", BaseURL: server.URL, HTTPClient: server.Client(), Auth: auth}
+	if _, err := client.RequestURL(http.MethodGet, server.URL+`/me/messages?$search=%22invoice%22&$skiptoken=abc`); err != nil {
+		t.Fatal(err)
+	}
+}

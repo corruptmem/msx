@@ -48,10 +48,28 @@ func (c Client) Request(method, path string, query map[string]string) (map[strin
 	if c.Auth == nil {
 		c.Auth = authRefresher{}
 	}
-	return c.request(method, path, query, false)
+	endpoint, err := c.buildEndpoint(path, query)
+	if err != nil {
+		return nil, err
+	}
+	return c.requestURL(method, endpoint, queryHasSearch(query), false)
 }
 
-func (c Client) request(method, path string, query map[string]string, forced bool) (map[string]any, error) {
+func (c Client) RequestURL(method, endpoint string) (map[string]any, error) {
+	if c.BaseURL == "" {
+		c.BaseURL = root
+	}
+	if c.HTTPClient == nil {
+		c.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	if c.Auth == nil {
+		c.Auth = authRefresher{}
+	}
+	endpoint = c.rewriteEndpoint(endpoint)
+	return c.requestURL(method, endpoint, queryContainsSearch(endpoint), false)
+}
+
+func (c Client) requestURL(method, endpoint string, useSearchHeader bool, forced bool) (map[string]any, error) {
 	var (
 		token store.Token
 		err   error
@@ -64,17 +82,6 @@ func (c Client) request(method, path string, query map[string]string, forced boo
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-	endpoint := c.BaseURL + path
-	if len(query) > 0 {
-		values := url.Values{}
-		for k, v := range query {
-			values.Set(k, v)
-		}
-		endpoint += "?" + values.Encode()
-	}
 	req, err := http.NewRequest(method, endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -82,7 +89,7 @@ func (c Client) request(method, path string, query map[string]string, forced boo
 	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "msx/0")
-	if _, ok := query["$search"]; ok {
+	if useSearchHeader {
 		req.Header.Set("ConsistencyLevel", "eventual")
 	}
 	resp, err := c.HTTPClient.Do(req)
@@ -95,7 +102,7 @@ func (c Client) request(method, path string, query map[string]string, forced boo
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized && !forced {
-		return c.request(method, path, query, true)
+		return c.requestURL(method, endpoint, useSearchHeader, true)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("%s", string(body))
@@ -106,4 +113,57 @@ func (c Client) request(method, path string, query map[string]string, forced boo
 	var out map[string]any
 	err = json.Unmarshal(body, &out)
 	return out, err
+}
+
+func (c Client) buildEndpoint(path string, query map[string]string) (string, error) {
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	endpoint := c.BaseURL + path
+	if len(query) == 0 {
+		return endpoint, nil
+	}
+	values := url.Values{}
+	for k, v := range query {
+		values.Set(k, v)
+	}
+	return endpoint + "?" + values.Encode(), nil
+}
+
+func (c Client) rewriteEndpoint(endpoint string) string {
+	if c.BaseURL == "" || c.BaseURL == root {
+		return endpoint
+	}
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		return endpoint
+	}
+	base, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return endpoint
+	}
+	if !strings.EqualFold(target.Host, "graph.microsoft.com") {
+		return endpoint
+	}
+	target.Scheme = base.Scheme
+	target.Host = base.Host
+	prefix := strings.TrimRight(base.Path, "/")
+	if prefix != "" && !strings.HasPrefix(target.Path, prefix+"/") && target.Path != prefix {
+		target.Path = prefix + target.Path
+	}
+	return target.String()
+}
+
+func queryHasSearch(query map[string]string) bool {
+	_, ok := query["$search"]
+	return ok
+}
+
+func queryContainsSearch(endpoint string) bool {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return false
+	}
+	_, ok := u.Query()["$search"]
+	return ok
 }

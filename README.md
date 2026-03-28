@@ -25,10 +25,14 @@ The design priority is not breadth. It is **auth durability**:
 ### Useful read-only commands
 - `whoami`
 - `mail` with sender/date/query/folder/unread filters
+- `mail-get` for one message record by id
 - `agenda` with explicit time range and query filtering
+- `event-get` for one calendar event by id
 - `files` for OneDrive listing/search
+- `file-get` for one OneDrive item by id
 - `contacts` supports display-name and email-prefix matching, but may need extra Graph consent beyond the baseline app setup
 - `sites` command is present for SharePoint/org search, but likewise needs extra consent if the profile was imported with baseline scopes only
+- `next` to continue any returned `@odata.nextLink`
 - `profiles`
 
 ## Why Go
@@ -134,6 +138,7 @@ msx mail --profile personal --sender noreply@example.com --since 2026-03-01T00:0
 msx mail --profile personal --folder inbox --unread --top 25
 msx mail --profile personal --query invoice --top 20
 msx mail --profile personal --subject invoice --top 50
+msx mail-get --profile personal AQMkAD... --body
 ```
 
 ### Calendar lookup
@@ -141,6 +146,7 @@ msx mail --profile personal --subject invoice --top 50
 ```bash
 msx agenda --profile personal --start 2026-03-28T00:00:00Z --end 2026-04-04T00:00:00Z
 msx agenda --profile personal --query dentist
+msx event-get --profile personal AAMkAG... --body
 ```
 
 ### Files / OneDrive
@@ -150,6 +156,7 @@ msx files --profile personal --top 20
 msx files --profile personal --path Documents
 msx files --profile personal --query passport --top 20
 msx files --profile personal --path Documents --kind folders
+msx file-get --profile personal 01ABCDEF234567890 --format json
 ```
 
 ### Contacts
@@ -165,6 +172,20 @@ msx contacts --profile personal --query alice@example.com
 ```bash
 msx sites --profile hexlium --query hexlium
 ```
+
+### Pagination continuation
+
+Graph already returns `@odata.nextLink` when there is another page. msx now gives you two boring ways to continue without hand-rolling HTTP:
+
+```bash
+msx mail --profile personal --top 25
+msx next --profile personal --url 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=...'
+
+# or keep the original command shape if you prefer
+msx mail --profile personal --next-link 'https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?$skiptoken=...'
+```
+
+For safety, `--next-link` / `next --url` only accept `https://graph.microsoft.com/...` URLs.
 
 ## Output shape
 
@@ -186,11 +207,13 @@ Current choices made for agent use:
 - JSON output by default
 - stable subcommands and flags
 - explicit range flags for agenda
+- direct detail-fetch commands for messages/events/files
+- next-page continuation via raw `@odata.nextLink` instead of inventing opaque cursors
 - query flags rather than interactive prompts
 - profile selection is explicit and cheap
 - read-only operations for safe automation
 - globals can appear before or after subcommands
-- basic input validation for common footguns (`--top > 0`, valid RFC3339 timestamps, `--end` after `--start`, constrained enums like `--kind`)
+- basic input validation for common footguns (`--top > 0`, valid RFC3339 timestamps, `--end` after `--start`, constrained enums like `--kind`, restricted next-link host/scheme)
 - client-side narrowing where it improves ergonomics without hiding Graph data (`mail --subject`, `files --kind`)
 
 ## Safety
@@ -215,7 +238,9 @@ Covered areas now include:
 - store durability/serialization behavior
 - forced refresh persistence
 - Graph `401` retry behavior and search headers
-- CLI global flag parsing, help-path behavior, and filtering helpers for mail/events/files
+- CLI global flag parsing, help-path behavior, next-link validation, and filtering helpers for mail/events/files
+- integration-style command tests for detail fetch and next-page continuation against a stub Graph server
+- output-shape checks that preserve top-level Graph fields like `@odata.nextLink` while applying client-side filters
 
 ## CI
 
@@ -238,11 +263,10 @@ Tested against the existing configured accounts:
 Still intentionally unfinished:
 - no write/mutation commands yet; the CLI is read-only outside auth flows
 - `--format text` is just pretty JSON, not a human-tuned renderer
-- there are no pagination helper commands yet; Graph pagination stays in the raw response
 - contacts and site search depend on the profile having the extra Graph consent they need
 
 Possible future work, if it earns its keep:
-- message/event/body detail fetch commands
+- detail fetch for contacts and sites too, if that proves materially useful
 - optional encryption-at-rest beyond filesystem permissions
 - backup/export/import tooling for state migration
 - command-specific text renderers for human-first use
