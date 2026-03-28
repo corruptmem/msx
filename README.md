@@ -47,14 +47,19 @@ Go gives us:
 
 ## Install
 
+For normal dogfooding/use, install the latest official GitHub Actions artifact into a local `bin/` folder:
+
 ```bash
-go build ./cmd/msx
+./scripts/install-from-github-actions.sh ./bin
+./bin/msx --profile personal whoami
 ```
 
-Or install to your Go bin:
+For local development only, you can still build directly:
 
 ```bash
-go install ./cmd/msx
+go build ./cmd/msx
+# or
+GO111MODULE=on go run ./cmd/msx --help
 ```
 
 ## Auth model
@@ -242,15 +247,13 @@ Covered areas now include:
 - integration-style command tests for detail fetch and next-page continuation against a stub Graph server
 - output-shape checks that preserve top-level Graph fields like `@odata.nextLink` while applying client-side filters
 
-## CI
+## CI and packaging
 
-GitHub Actions now runs on push and pull request:
-- `gofmt -l .` to catch formatting drift
-- `go vet ./...`
-- `go test ./...`
-- `go build ./cmd/msx`
-- `go test -race ./...` on Ubuntu for the concurrency-sensitive auth/store path
-- matrix coverage on Ubuntu, macOS, and Windows
+GitHub Actions now provides two lanes:
+- `ci.yml` runs `gofmt -l .`, `go vet ./...`, `go test ./...`, `go build ./cmd/msx`, and `go test -race ./...` with matrix coverage on Ubuntu, macOS, and Windows
+- `package.yml` builds official archives for Linux/macOS/Windows, uploads per-platform artifacts, and publishes a `SHA256SUMS` artifact for verification
+
+Local dogfooding should prefer those packaged artifacts over ad-hoc local builds.
 
 ## Verified non-destructive flows
 
@@ -258,15 +261,7 @@ Tested against the existing configured accounts:
 - `MS Personal`: import, `whoami`, `mail`, `agenda`, `files`, mail search, file search
 - `MS Hexlium`: import, `whoami`, `mail`, `agenda`
 
-## Current rough edges
+## Project tracking
 
-Still intentionally unfinished:
-- no write/mutation commands yet; the CLI is read-only outside auth flows
-- `--format text` is just pretty JSON, not a human-tuned renderer
-- contacts and site search depend on the profile having the extra Graph consent they need
-
-Possible future work, if it earns its keep:
-- detail fetch for contacts and sites too, if that proves materially useful
-- optional encryption-at-rest beyond filesystem permissions
-- backup/export/import tooling for state migration
-- command-specific text renderers for human-first use
+Backlog and remaining work live in GitHub issues, not in this README.
+Treat the issue tracker as the source of truth for what is left: https://github.com/corruptmem/msx/issues

@@ -1,0 +1,104 @@
+name: package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: package (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+    env:
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          ext=""
+          if [ "${GOOS}" = "windows" ]; then
+            ext=".exe"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "dist/msx${ext}" ./cmd/msx
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="msx-${{ matrix.goos }}-${{ matrix.goarch }}"
+          stage="dist/${pkg}"
+          mkdir -p "$stage"
+          cp README.md LICENSE "$stage/"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            cp dist/msx.exe "$stage/"
+            (cd dist && 7z a -tzip "${pkg}.zip" "${pkg}" >/dev/null)
+            sha256sum "dist/${pkg}.zip" > "dist/${pkg}.zip.sha256"
+          else
+            cp dist/msx "$stage/"
+            tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
+            sha256sum "dist/${pkg}.tar.gz" > "dist/${pkg}.tar.gz.sha256"
+          fi
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: msx-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/msx-${{ matrix.goos }}-${{ matrix.goarch }}.*
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Assemble SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          find dist -type f -name '*.sha256' -print0 | sort -z | xargs -0 cat > dist/SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: msx-checksums
+          path: dist/SHA256SUMS
+          if-no-files-found: error
