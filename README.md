@@ -78,6 +78,34 @@ Default state location:
 Override with:
 - `MSX_HOME=/some/path`
 
+### Optional encryption at rest
+
+By default msx relies on filesystem permissions (`0700` dir, `0600` DB file).
+For environments that require more, set `MSX_STORE_KEY` to a 32-byte key:
+
+```sh
+# Generate a key (store it somewhere safe — 1Password works well):
+openssl rand -hex 32
+
+# Then export it in every shell session that runs msx:
+export MSX_STORE_KEY=<64 hex chars>
+```
+
+When the variable is set, token values are encrypted in the bbolt store using
+**AES-256-GCM** with a random 12-byte nonce per write.  Profile metadata
+(client ID, authority, scopes) is not encrypted.
+
+Key management expectations:
+- The key is **never persisted to disk** by msx.  You are responsible for keeping it.
+- If you lose the key you can still recover tokens using `state-export` while
+  the key is available, then reinstate them with `state-import` once you have
+  a replacement.
+- Consistency is enforced: if a key is set but stored tokens are plain (or
+  vice versa), msx will fail with a clear error rather than silently
+  mis-reading data.
+- Encryption is optional.  Plain-mode operation (no key) is the default and
+  remains fully supported.
+
 Stored per profile:
 - authority / tenant hint
 - client ID

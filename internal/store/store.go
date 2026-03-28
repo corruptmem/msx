@@ -41,7 +41,8 @@ type Token struct {
 }
 
 type Store struct {
-	db *bolt.DB
+	db  *bolt.DB
+	key []byte // nil means no encryption
 }
 
 const (
@@ -94,7 +95,12 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	_ = os.Chmod(dbPath, 0o600)
-	return &Store{db: db}, nil
+	key, err := encryptionKey()
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Store{db: db, key: key}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -119,6 +125,10 @@ func (s *Store) SaveToken(profile string, token Token) error {
 	if err != nil {
 		return err
 	}
+	payload, err = encodeToken(s.key, payload)
+	if err != nil {
+		return err
+	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(tokensBucket).Put([]byte(profile), payload)
 	})
@@ -135,6 +145,10 @@ func (s *Store) SaveProfileAndToken(profile Profile, token Token) error {
 		return err
 	}
 	tp, err := json.Marshal(token)
+	if err != nil {
+		return err
+	}
+	tp, err = encodeToken(s.key, tp)
 	if err != nil {
 		return err
 	}
@@ -165,7 +179,11 @@ func (s *Store) GetToken(name string) (Token, error) {
 		if raw == nil {
 			return os.ErrNotExist
 		}
-		return json.Unmarshal(raw, &token)
+		plain, err := decodeToken(s.key, raw)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(plain, &token)
 	})
 	return token, err
 }
@@ -201,18 +219,25 @@ func (s *Store) exportProfiles(names []string) (StateBackup, error) {
 	err := s.db.View(func(tx *bolt.Tx) error {
 		pb := tx.Bucket(profilesBucket)
 		tb := tx.Bucket(tokensBucket)
+		readToken := func(name string, tokenRaw []byte) (Token, error) {
+			if tokenRaw == nil {
+				return Token{}, fmt.Errorf("profile %q is missing token state: %w", name, os.ErrNotExist)
+			}
+			plain, err := decodeToken(s.key, tokenRaw)
+			if err != nil {
+				return Token{}, err
+			}
+			var token Token
+			return token, json.Unmarshal(plain, &token)
+		}
 		if len(names) == 0 {
 			return pb.ForEach(func(_, v []byte) error {
 				var profile Profile
 				if err := json.Unmarshal(v, &profile); err != nil {
 					return err
 				}
-				tokenRaw := tb.Get([]byte(profile.Name))
-				if tokenRaw == nil {
-					return fmt.Errorf("profile %q is missing token state: %w", profile.Name, os.ErrNotExist)
-				}
-				var token Token
-				if err := json.Unmarshal(tokenRaw, &token); err != nil {
+				token, err := readToken(profile.Name, tb.Get([]byte(profile.Name)))
+				if err != nil {
 					return err
 				}
 				backup.Profiles = append(backup.Profiles, StateBackupProfile{
@@ -223,7 +248,15 @@ func (s *Store) exportProfiles(names []string) (StateBackup, error) {
 			})
 		}
 		for _, name := range names {
-			profile, token, err := getProfileAndToken(tx, name)
+			var profile Profile
+			pr := pb.Get([]byte(name))
+			if pr == nil {
+				return fmt.Errorf("profile %q is not configured: %w", name, os.ErrNotExist)
+			}
+			if err := json.Unmarshal(pr, &profile); err != nil {
+				return err
+			}
+			token, err := readToken(name, tb.Get([]byte(name)))
 			if err != nil {
 				return err
 			}
@@ -308,7 +341,11 @@ func (s *Store) ImportStateBackup(backup StateBackup, overwrite bool) error {
 			if err := pb.Put([]byte(item.name), item.profile); err != nil {
 				return err
 			}
-			if err := tb.Put([]byte(item.name), item.token); err != nil {
+			tokenPayload, err := encodeToken(s.key, item.token)
+			if err != nil {
+				return err
+			}
+			if err := tb.Put([]byte(item.name), tokenPayload); err != nil {
 				return err
 			}
 		}
@@ -319,7 +356,7 @@ func (s *Store) ImportStateBackup(backup StateBackup, overwrite bool) error {
 func (s *Store) RefreshIfNeeded(name string, skew time.Duration, fn func(Profile, Token) (Token, error)) (Token, error) {
 	var out Token
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		profile, token, err := getProfileAndToken(tx, name)
+		profile, token, err := getProfileAndTokenWithKey(tx, name, s.key)
 		if err != nil {
 			return err
 		}
@@ -331,7 +368,7 @@ func (s *Store) RefreshIfNeeded(name string, skew time.Duration, fn func(Profile
 		if err != nil {
 			return err
 		}
-		if err := putToken(tx, name, next); err != nil {
+		if err := putTokenWithKey(tx, name, next, s.key); err != nil {
 			return err
 		}
 		out = next
@@ -343,7 +380,7 @@ func (s *Store) RefreshIfNeeded(name string, skew time.Duration, fn func(Profile
 func (s *Store) ForceRefresh(name string, fn func(Profile, Token) (Token, error)) (Token, error) {
 	var out Token
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		profile, token, err := getProfileAndToken(tx, name)
+		profile, token, err := getProfileAndTokenWithKey(tx, name, s.key)
 		if err != nil {
 			return err
 		}
@@ -351,7 +388,7 @@ func (s *Store) ForceRefresh(name string, fn func(Profile, Token) (Token, error)
 		if err != nil {
 			return err
 		}
-		if err := putToken(tx, name, next); err != nil {
+		if err := putTokenWithKey(tx, name, next, s.key); err != nil {
 			return err
 		}
 		out = next
@@ -361,6 +398,10 @@ func (s *Store) ForceRefresh(name string, fn func(Profile, Token) (Token, error)
 }
 
 func getProfileAndToken(tx *bolt.Tx, name string) (Profile, Token, error) {
+	return getProfileAndTokenWithKey(tx, name, nil)
+}
+
+func getProfileAndTokenWithKey(tx *bolt.Tx, name string, key []byte) (Profile, Token, error) {
 	pb := tx.Bucket(profilesBucket)
 	tb := tx.Bucket(tokensBucket)
 	pr := pb.Get([]byte(name))
@@ -369,22 +410,34 @@ func getProfileAndToken(tx *bolt.Tx, name string) (Profile, Token, error) {
 		return Profile{}, Token{}, fmt.Errorf("profile %q is not configured: %w", name, os.ErrNotExist)
 	}
 	var profile Profile
-	var token Token
 	if err := json.Unmarshal(pr, &profile); err != nil {
 		return Profile{}, Token{}, err
 	}
-	if err := json.Unmarshal(tr, &token); err != nil {
+	plain, err := decodeToken(key, tr)
+	if err != nil {
+		return Profile{}, Token{}, err
+	}
+	var token Token
+	if err := json.Unmarshal(plain, &token); err != nil {
 		return Profile{}, Token{}, err
 	}
 	return profile, token, nil
 }
 
-func putToken(tx *bolt.Tx, name string, token Token) error {
+func putTokenWithKey(tx *bolt.Tx, name string, token Token, key []byte) error {
 	raw, err := json.Marshal(token)
 	if err != nil {
 		return err
 	}
+	raw, err = encodeToken(key, raw)
+	if err != nil {
+		return err
+	}
 	return tx.Bucket(tokensBucket).Put([]byte(name), raw)
+}
+
+func putToken(tx *bolt.Tx, name string, token Token) error {
+	return putTokenWithKey(tx, name, token, nil)
 }
 
 func RequireTokenPayload(access, refresh string) error {

@@ -490,3 +490,76 @@ func TestRenderProfilesText(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderAgendaListText(t *testing.T) {
+	text, ok := renderText("agenda", map[string]any{
+		"@odata.nextLink": "https://graph.microsoft.com/v1.0/me/calendarView?$skiptoken=abc",
+		"value": []any{
+			map[string]any{
+				"subject":   "Standup",
+				"start":     map[string]any{"dateTime": "2026-03-28T09:00:00"},
+				"end":       map[string]any{"dateTime": "2026-03-28T09:30:00"},
+				"location":  map[string]any{"displayName": "Room 1"},
+				"organizer": map[string]any{"emailAddress": map[string]any{"address": "boss@example.com"}},
+				"webLink":   "https://outlook.office.com/calendar/event-1",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("expected renderer to handle agenda")
+	}
+	for _, needle := range []string{"Standup", "2026-03-28T09:00:00", "Room 1", "boss@example.com", "next: https://graph.microsoft.com"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("expected %q in output: %s", needle, text)
+		}
+	}
+}
+
+func TestRenderFilesListText(t *testing.T) {
+	text, ok := renderText("files", map[string]any{
+		"value": []any{
+			map[string]any{
+				"name":                 "report.docx",
+				"file":                 map[string]any{},
+				"size":                 float64(4096),
+				"lastModifiedDateTime": "2026-03-27T10:00:00Z",
+				"parentReference":      map[string]any{"path": "/drive/root:/Documents"},
+				"webUrl":               "https://onedrive.live.com/file-1",
+			},
+			map[string]any{
+				"name":   "Archive",
+				"folder": map[string]any{"childCount": float64(3)},
+				"webUrl": "https://onedrive.live.com/dir-1",
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("expected renderer to handle files")
+	}
+	for _, needle := range []string{"[file]", "report.docx", "4096", "[folder]", "Archive"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("expected %q in output: %s", needle, text)
+		}
+	}
+}
+
+func TestRenderWhoamiText(t *testing.T) {
+	text, ok := renderText("whoami", map[string]any{
+		"displayName":        "Cameron Harris",
+		"userPrincipalName":  "cam@example.com",
+		"mail":               "cam@example.com",
+		"id":                 "user-abc-123",
+		"jobTitle":           "Engineer",
+		"officeLocation":     "Remote",
+		"mobilePhone":        "+1 555 0100",
+		"preferredLanguage":  "en-US",
+	})
+	if !ok {
+		t.Fatal("expected renderer to handle whoami")
+	}
+	for _, needle := range []string{"Cameron Harris", "cam@example.com", "user-abc-123", "Engineer", "Remote", "+1 555 0100", "en-US"} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("expected %q in output: %s", needle, text)
+		}
+	}
+}
