@@ -5,6 +5,7 @@ A Microsoft Graph CLI built for both humans and agents.
 The design priority is not breadth. It is **auth durability**:
 - store both access and refresh tokens on disk
 - rotate refresh tokens safely when Microsoft returns a new one
+- preserve the existing refresh token if Microsoft does not return a replacement during refresh
 - avoid partial writes and token-loss corruption
 - isolate profiles cleanly across personal and org accounts
 - make the CLI predictable for automation
@@ -18,14 +19,15 @@ The design priority is not breadth. It is **auth durability**:
 - Uses **bbolt** (transactional, crash-safe, single-writer, durable file-backed store)
 - Refreshes tokens **on demand** under a write transaction so concurrent callers do not stomp each other
 - Persists rotated refresh tokens atomically with the new access token
+- Retries a request once with a forced token refresh if Graph returns `401 Unauthorized`
 - Uses private filesystem permissions (`0700` dir, `0600` DB file)
 
 ### Useful read-only commands
 - `whoami`
-- `mail` with sender/date/query filters
+- `mail` with sender/date/query/folder/unread filters
 - `agenda` with explicit time range and query filtering
 - `files` for OneDrive listing/search
-- `contacts` command is present but needs extra Graph consent beyond the current baseline app setup
+- `contacts` supports display-name and email-prefix matching, but may need extra Graph consent beyond the baseline app setup
 - `sites` command is present for SharePoint/org search, but likewise needs extra consent if the profile was imported with baseline scopes only
 - `profiles`
 
@@ -129,6 +131,7 @@ msx profiles
 ```bash
 msx mail --profile personal --top 10
 msx mail --profile personal --sender noreply@example.com --since 2026-03-01T00:00:00Z
+msx mail --profile personal --folder inbox --unread --top 25
 msx mail --profile personal --query invoice --top 20
 ```
 
@@ -152,6 +155,7 @@ msx files --profile personal --query passport --top 20
 ```bash
 msx contacts --profile personal --top 20
 msx contacts --profile personal --query ali
+msx contacts --profile personal --query alice@example.com
 ```
 
 ### SharePoint / org sites
@@ -159,6 +163,18 @@ msx contacts --profile personal --query ali
 ```bash
 msx sites --profile hexlium --query hexlium
 ```
+
+## Output shape
+
+The CLI currently returns Graph-shaped JSON rather than inventing a second schema layer.
+
+That is deliberate:
+- fewer surprise transformations
+- easier debugging against Microsoft docs
+- agents can pass values through without lossy remapping
+- `@odata.nextLink` and similar fields remain available when Graph returns them
+
+`--format text` currently prints pretty JSON rather than a bespoke table renderer. That is honest, boring, and easy to diff. If a real text renderer is added later, it should be command-specific and tested.
 
 ## Agent ergonomics
 
@@ -172,6 +188,7 @@ Current choices made for agent use:
 - profile selection is explicit and cheap
 - read-only operations for safe automation
 - globals can appear before or after subcommands
+- basic input validation for common footguns (`--top > 0`, valid RFC3339 timestamps, `--end` after `--start`)
 
 ## Safety
 
@@ -190,6 +207,21 @@ That keeps testing safe while the auth layer gets battle-hardened first.
 go test ./...
 ```
 
+Covered areas now include:
+- token JSON parsing and refresh-token preservation
+- store durability/serialization behavior
+- forced refresh persistence
+- Graph `401` retry behavior
+- CLI global flag parsing and event filtering helpers
+
+## CI
+
+GitHub Actions now runs on push and pull request:
+- `gofmt -l .` to catch formatting drift
+- `go test ./...`
+- `go build ./cmd/msx`
+- matrix coverage on Ubuntu, macOS, and Windows
+
 ## Verified non-destructive flows
 
 Tested against the existing configured accounts:
@@ -199,10 +231,10 @@ Tested against the existing configured accounts:
 ## What still remains to make it excellent
 
 High-value next steps:
-- richer mail filtering (`subject`, pagination/cursors, folder discovery)
-- contact lookup by email and broader consent-aware search
+- richer mail filtering (`subject`, pagination helpers, folder discovery)
+- contact lookup by exact email and broader consent-aware search
 - file metadata normalization for cleaner downstream indexing
 - message/event/body detail fetch commands
 - OS keychain / age-backed optional encryption-at-rest for the DB
-- better documented output schemas per command
 - backup/export/import tooling for state migration
+- command-specific text renderers if human-first output becomes a real priority

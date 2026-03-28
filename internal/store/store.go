@@ -169,19 +169,8 @@ func (s *Store) ListProfiles() ([]Profile, error) {
 func (s *Store) RefreshIfNeeded(name string, skew time.Duration, fn func(Profile, Token) (Token, error)) (Token, error) {
 	var out Token
 	err := s.db.Update(func(tx *bolt.Tx) error {
-		pb := tx.Bucket(profilesBucket)
-		tb := tx.Bucket(tokensBucket)
-		pr := pb.Get([]byte(name))
-		tr := tb.Get([]byte(name))
-		if pr == nil || tr == nil {
-			return fmt.Errorf("profile %q is not configured: %w", name, os.ErrNotExist)
-		}
-		var profile Profile
-		var token Token
-		if err := json.Unmarshal(pr, &profile); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(tr, &token); err != nil {
+		profile, token, err := getProfileAndToken(tx, name)
+		if err != nil {
 			return err
 		}
 		if time.Unix(token.ExpiresAt, 0).After(time.Now().Add(skew)) {
@@ -192,17 +181,60 @@ func (s *Store) RefreshIfNeeded(name string, skew time.Duration, fn func(Profile
 		if err != nil {
 			return err
 		}
-		raw, err := json.Marshal(next)
-		if err != nil {
-			return err
-		}
-		if err := tb.Put([]byte(name), raw); err != nil {
+		if err := putToken(tx, name, next); err != nil {
 			return err
 		}
 		out = next
 		return nil
 	})
 	return out, err
+}
+
+func (s *Store) ForceRefresh(name string, fn func(Profile, Token) (Token, error)) (Token, error) {
+	var out Token
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		profile, token, err := getProfileAndToken(tx, name)
+		if err != nil {
+			return err
+		}
+		next, err := fn(profile, token)
+		if err != nil {
+			return err
+		}
+		if err := putToken(tx, name, next); err != nil {
+			return err
+		}
+		out = next
+		return nil
+	})
+	return out, err
+}
+
+func getProfileAndToken(tx *bolt.Tx, name string) (Profile, Token, error) {
+	pb := tx.Bucket(profilesBucket)
+	tb := tx.Bucket(tokensBucket)
+	pr := pb.Get([]byte(name))
+	tr := tb.Get([]byte(name))
+	if pr == nil || tr == nil {
+		return Profile{}, Token{}, fmt.Errorf("profile %q is not configured: %w", name, os.ErrNotExist)
+	}
+	var profile Profile
+	var token Token
+	if err := json.Unmarshal(pr, &profile); err != nil {
+		return Profile{}, Token{}, err
+	}
+	if err := json.Unmarshal(tr, &token); err != nil {
+		return Profile{}, Token{}, err
+	}
+	return profile, token, nil
+}
+
+func putToken(tx *bolt.Tx, name string, token Token) error {
+	raw, err := json.Marshal(token)
+	if err != nil {
+		return err
+	}
+	return tx.Bucket(tokensBucket).Put([]byte(name), raw)
 }
 
 func RequireTokenPayload(access, refresh string) error {

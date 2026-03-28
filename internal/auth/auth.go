@@ -24,6 +24,11 @@ var DefaultScopes = []string{
 	"Files.ReadWrite",
 }
 
+var (
+	httpClient        = &http.Client{Timeout: 30 * time.Second}
+	loginEndpointRoot = "https://login.microsoftonline.com"
+)
+
 type DeviceCodeFlow struct {
 	UserCode        string `json:"user_code"`
 	DeviceCode      string `json:"device_code"`
@@ -41,6 +46,11 @@ type TokenResponse struct {
 	ExpiresIn    int    `json:"expires_in"`
 }
 
+type oauthError struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description"`
+}
+
 type opItem struct {
 	Fields []struct {
 		Label string `json:"label"`
@@ -52,7 +62,7 @@ func BeginDeviceLogin(clientID, authority string, scopes []string) (DeviceCodeFl
 	values := url.Values{}
 	values.Set("client_id", clientID)
 	values.Set("scope", strings.Join(scopes, " "))
-	body, err := formPost(fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/devicecode", authority), values)
+	body, err := formPost(fmt.Sprintf("%s/%s/oauth2/v2.0/devicecode", loginEndpointRoot, authority), values)
 	if err != nil {
 		return DeviceCodeFlow{}, err
 	}
@@ -69,16 +79,16 @@ func FinishDeviceLogin(clientID, authority string, flow DeviceCodeFlow) (store.T
 		values.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 		values.Set("client_id", clientID)
 		values.Set("device_code", flow.DeviceCode)
-		body, err := formPost(fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", authority), values)
+		body, err := formPost(fmt.Sprintf("%s/%s/oauth2/v2.0/token", loginEndpointRoot, authority), values)
 		if err == nil {
-			return tokenFromJSON(body)
+			return tokenFromJSON(body, "")
 		}
-		msg := err.Error()
-		if strings.Contains(msg, `"authorization_pending"`) {
+		oe := parseOAuthError(err)
+		switch oe.Error {
+		case "authorization_pending":
 			time.Sleep(interval)
 			continue
-		}
-		if strings.Contains(msg, `"slow_down"`) {
+		case "slow_down":
 			interval += 5 * time.Second
 			time.Sleep(interval)
 			continue
@@ -135,32 +145,44 @@ func RefreshIfNeeded(s *store.Store, profile string, skew time.Duration) (store.
 	})
 }
 
+func ForceRefresh(s *store.Store, profile string) (store.Token, error) {
+	return s.ForceRefresh(profile, func(p store.Profile, t store.Token) (store.Token, error) {
+		return refreshWithToken(p.ClientID, p.Authority, t.RefreshToken, p.Scopes)
+	})
+}
+
 func refreshWithToken(clientID, authority, refresh string, scopes []string) (store.Token, error) {
 	values := url.Values{}
 	values.Set("client_id", clientID)
 	values.Set("grant_type", "refresh_token")
 	values.Set("refresh_token", refresh)
 	values.Set("scope", strings.Join(scopes, " "))
-	body, err := formPost(fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", authority), values)
+	body, err := formPost(fmt.Sprintf("%s/%s/oauth2/v2.0/token", loginEndpointRoot, authority), values)
 	if err != nil {
 		return store.Token{}, err
 	}
-	return tokenFromJSON(body)
+	return tokenFromJSON(body, refresh)
 }
 
-func tokenFromJSON(body []byte) (store.Token, error) {
+func tokenFromJSON(body []byte, fallbackRefresh string) (store.Token, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return store.Token{}, err
 	}
 	access, _ := payload["access_token"].(string)
 	refresh, _ := payload["refresh_token"].(string)
+	if refresh == "" {
+		refresh = fallbackRefresh
+	}
 	if err := store.RequireTokenPayload(access, refresh); err != nil {
 		return store.Token{}, err
 	}
 	tokenType, _ := payload["token_type"].(string)
 	scope, _ := payload["scope"].(string)
 	expiresIn, _ := payload["expires_in"].(float64)
+	if payload["refresh_token"] == nil && refresh != "" {
+		payload["refresh_token"] = refresh
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return store.Token{}, err
@@ -183,7 +205,7 @@ func formPost(endpoint string, values url.Values) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -196,6 +218,17 @@ func formPost(endpoint string, values url.Values) ([]byte, error) {
 		return nil, fmt.Errorf("%s", string(body))
 	}
 	return body, nil
+}
+
+func parseOAuthError(err error) oauthError {
+	if err == nil {
+		return oauthError{}
+	}
+	var oe oauthError
+	if json.Unmarshal([]byte(err.Error()), &oe) == nil && oe.Error != "" {
+		return oe
+	}
+	return oauthError{}
 }
 
 func getOPItem(title, vault string) (opItem, error) {

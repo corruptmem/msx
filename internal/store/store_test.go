@@ -72,3 +72,39 @@ func TestRefreshIfNeededSerializesWriters(t *testing.T) {
 		t.Fatalf("expected one refresh call, got %d", calls)
 	}
 }
+
+func TestForceRefreshAlwaysRefreshes(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	profile := Profile{Name: "p", Authority: "common", ClientID: "cid", Scopes: []string{"User.Read"}}
+	token := Token{AccessToken: "still-good", RefreshToken: "rt", TokenType: "Bearer", Scope: "User.Read", ExpiresAt: time.Now().Add(time.Hour).Unix(), ObtainedAt: time.Now().Unix(), Raw: json.RawMessage(`{"old":true}`)}
+	if err := s.SaveProfileAndToken(profile, token); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	next, err := s.ForceRefresh("p", func(Profile, Token) (Token, error) {
+		calls++
+		return Token{AccessToken: "new", RefreshToken: "new-rt", TokenType: "Bearer", Scope: "User.Read", ExpiresAt: time.Now().Add(2 * time.Hour).Unix(), ObtainedAt: time.Now().Unix(), Raw: json.RawMessage(`{"forced":true}`)}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected one force refresh call, got %d", calls)
+	}
+	if next.AccessToken != "new" {
+		t.Fatalf("unexpected token: %+v", next)
+	}
+	stored, err := s.GetToken("p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.AccessToken != "new" || stored.RefreshToken != "new-rt" {
+		t.Fatalf("force refresh was not persisted: %+v", stored)
+	}
+}

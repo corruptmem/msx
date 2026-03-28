@@ -19,6 +19,21 @@ type globalFlags struct {
 	format  string
 }
 
+const usageText = `usage: msx [--profile name] [--format text|json] <command> [flags]
+
+commands:
+  login       Start device-code login and save tokens locally
+  import-op   Import an existing Microsoft account from 1Password
+  profiles    List configured profiles
+  whoami      Show the current Graph account
+  mail        List mail with optional filters
+  agenda      List calendar events in a time range
+  files       List or search OneDrive files
+  contacts    List or search contacts
+  sites       Search SharePoint / org sites
+  help        Show this message
+`
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -32,6 +47,9 @@ func run(args []string) error {
 		return err
 	}
 	if len(rest) == 0 {
+		return usage()
+	}
+	if rest[0] == "help" || rest[0] == "--help" || rest[0] == "-h" {
 		return usage()
 	}
 
@@ -100,7 +118,7 @@ func parseGlobals(args []string) (globalFlags, []string, error) {
 }
 
 func usage() error {
-	return fmt.Errorf("usage: msx [--profile name] [--format text|json] <login|import-op|profiles|whoami|mail|agenda|files|contacts|sites> ...")
+	return fmt.Errorf(usageText)
 }
 
 func cmdLogin(s *store.Store, g globalFlags, args []string) error {
@@ -184,7 +202,11 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	query := fs.String("query", "", "Graph search expression text")
 	since := fs.String("since", "", "received since RFC3339 timestamp")
 	folder := fs.String("folder", "inbox", "well-known mail folder or folder id")
+	unread := fs.Bool("unread", false, "only include unread messages")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
 	path := fmt.Sprintf("/me/mailFolders/%s/messages", *folder)
@@ -198,6 +220,9 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 			return fmt.Errorf("invalid --since, want RFC3339: %w", err)
 		}
 		filters = append(filters, fmt.Sprintf("receivedDateTime ge %s", *since))
+	}
+	if *unread {
+		filters = append(filters, "isRead eq false")
 	}
 	if len(filters) > 0 {
 		q["$filter"] = strings.Join(filters, " and ")
@@ -223,11 +248,19 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if _, err := time.Parse(time.RFC3339, *start); err != nil {
+	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
-	if _, err := time.Parse(time.RFC3339, *end); err != nil {
-		return err
+	startTime, err := time.Parse(time.RFC3339, *start)
+	if err != nil {
+		return fmt.Errorf("invalid --start, want RFC3339: %w", err)
+	}
+	endTime, err := time.Parse(time.RFC3339, *end)
+	if err != nil {
+		return fmt.Errorf("invalid --end, want RFC3339: %w", err)
+	}
+	if !endTime.After(startTime) {
+		return fmt.Errorf("--end must be after --start")
 	}
 	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", "/me/calendarView", map[string]string{
 		"startDateTime": *start,
@@ -253,6 +286,9 @@ func cmdFiles(s *store.Store, g globalFlags, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := requirePositive("--top", *top); err != nil {
+		return err
+	}
 	endpoint := "/me/drive/root/children"
 	params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,name,webUrl,file,folder,size,lastModifiedDateTime,parentReference"}
 	if *query != "" {
@@ -274,10 +310,13 @@ func cmdContacts(s *store.Store, g globalFlags, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	if err := requirePositive("--top", *top); err != nil {
+		return err
+	}
 	params := map[string]string{"$top": fmt.Sprint(*top), "$select": "id,displayName,emailAddresses,mobilePhone,businessPhones", "$orderby": "displayName"}
 	if *query != "" {
 		safe := strings.ReplaceAll(*query, "'", "''")
-		params["$filter"] = fmt.Sprintf("startswith(displayName,'%s')", safe)
+		params["$filter"] = fmt.Sprintf("startswith(displayName,'%s') or emailAddresses/any(e:startswith(e/address,'%s'))", safe, safe)
 	}
 	data, err := graph.Client{Store: s, Profile: g.profile}.Request("GET", "/me/contacts", params)
 	if err != nil {
@@ -291,6 +330,9 @@ func cmdSites(s *store.Store, g globalFlags, args []string) error {
 	top := fs.Int("top", 10, "maximum number of sites")
 	query := fs.String("query", "", "site search query")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := requirePositive("--top", *top); err != nil {
 		return err
 	}
 	if *query == "" {
@@ -351,4 +393,11 @@ func filterEvents(v any, q string) []map[string]any {
 		}
 	}
 	return out
+}
+
+func requirePositive(name string, v int) error {
+	if v <= 0 {
+		return fmt.Errorf("%s must be > 0", name)
+	}
+	return nil
 }
