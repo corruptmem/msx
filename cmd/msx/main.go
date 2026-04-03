@@ -440,7 +440,7 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	end := fs.String("end", time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339), "range end RFC3339")
 	query := fs.String("query", "", "search text applied client-side to subject/location/organizer")
 	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
-	tzName := fs.String("tz", "UTC", "IANA timezone for start/end dateTime output (e.g. America/New_York)")
+	tzName := fs.String("tz", "UTC", "IANA timezone for start/end dateTime output (e.g. Europe/London). Note: Graph returns event times in the calendar's own timezone; --tz converts what is stored in the dateTime field.")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -482,11 +482,11 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	if *query != "" {
 		data["value"] = filterEvents(data["value"], *query)
 	}
-	agendaLoc, agendaErr := parseLocation(*tzName)
-	if agendaErr != nil {
-		return agendaErr
+	loc, err := parseLocation(*tzName)
+	if err != nil {
+		return err
 	}
-	convertAgendaTZ(data["value"], agendaLoc)
+	convertAgendaTZ(data["value"], loc)
 	return emit(g, "agenda", data)
 }
 

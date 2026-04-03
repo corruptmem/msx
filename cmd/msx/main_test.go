@@ -563,3 +563,110 @@ func TestRenderWhoamiText(t *testing.T) {
 		}
 	}
 }
+
+func TestParseLocationUTC(t *testing.T) {
+	loc, err := parseLocation("UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc != time.UTC {
+		t.Fatalf("expected time.UTC, got %v", loc)
+	}
+}
+
+func TestParseLocationEmpty(t *testing.T) {
+	loc, err := parseLocation("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc != time.UTC {
+		t.Fatalf("expected time.UTC, got %v", loc)
+	}
+}
+
+func TestParseLocationValid(t *testing.T) {
+	loc, err := parseLocation("Europe/London")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loc.String() != "Europe/London" {
+		t.Fatalf("unexpected location: %v", loc)
+	}
+}
+
+func TestParseLocationInvalid(t *testing.T) {
+	_, err := parseLocation("Fake/Zone")
+	if err == nil {
+		t.Fatal("expected error for unknown timezone")
+	}
+}
+
+func TestConvertTZUTCIdentity(t *testing.T) {
+	s := "2026-04-03T10:00:00Z"
+	// UTC short-circuits — returns as-is
+	got := convertTZ(time.UTC, s)
+	if got != s {
+		t.Fatalf("expected identity for UTC, got %q", got)
+	}
+}
+
+func TestConvertTZShiftsOffset(t *testing.T) {
+	loc, _ := parseLocation("Europe/London")
+	// BST offset is +01:00 from late March
+	got := convertTZ(loc, "2026-04-03T10:00:00Z")
+	if got != "2026-04-03T11:00:00+01:00" {
+		t.Fatalf("unexpected result: %q", got)
+	}
+}
+
+func TestConvertTZGraphNoSuffix(t *testing.T) {
+	// Graph agenda datetimes have no Z or offset
+	loc, _ := parseLocation("Europe/London")
+	got := convertTZ(loc, "2026-04-03T10:00:00.0000000")
+	// parsed as UTC wall time, shifted to BST
+	if got != "2026-04-03T11:00:00+01:00" {
+		t.Fatalf("unexpected result: %q", got)
+	}
+}
+
+func TestConvertTZUnparseable(t *testing.T) {
+	loc, _ := parseLocation("Europe/London")
+	s := "not-a-date"
+	got := convertTZ(loc, s)
+	if got != s {
+		t.Fatalf("expected unchanged string for unparseable input, got %q", got)
+	}
+}
+
+func TestConvertMailTZ(t *testing.T) {
+	loc, _ := parseLocation("America/New_York")
+	items := []map[string]any{
+		{"receivedDateTime": "2026-04-03T15:00:00Z", "subject": "Hello"},
+	}
+	convertMailTZ(items, loc)
+	got := items[0]["receivedDateTime"].(string)
+	// UTC-4 in April (EDT)
+	if got != "2026-04-03T11:00:00-04:00" {
+		t.Fatalf("unexpected result: %q", got)
+	}
+}
+
+func TestConvertAgendaTZ(t *testing.T) {
+	loc, _ := parseLocation("America/New_York")
+	items := []map[string]any{
+		{
+			"subject": "Standup",
+			"start":   map[string]any{"dateTime": "2026-04-03T15:00:00Z", "timeZone": "UTC"},
+			"end":     map[string]any{"dateTime": "2026-04-03T15:30:00Z", "timeZone": "UTC"},
+		},
+	}
+	convertAgendaTZ(items, loc)
+	start := nestedMap(items[0], "start")["dateTime"].(string)
+	end := nestedMap(items[0], "end")["dateTime"].(string)
+	if start != "2026-04-03T11:00:00-04:00" {
+		t.Fatalf("unexpected start: %q", start)
+	}
+	if end != "2026-04-03T11:30:00-04:00" {
+		t.Fatalf("unexpected end: %q", end)
+	}
+}
