@@ -545,14 +545,14 @@ func TestRenderFilesListText(t *testing.T) {
 
 func TestRenderWhoamiText(t *testing.T) {
 	text, ok := renderText("whoami", map[string]any{
-		"displayName":        "Cameron Harris",
-		"userPrincipalName":  "cam@example.com",
-		"mail":               "cam@example.com",
-		"id":                 "user-abc-123",
-		"jobTitle":           "Engineer",
-		"officeLocation":     "Remote",
-		"mobilePhone":        "+1 555 0100",
-		"preferredLanguage":  "en-US",
+		"displayName":       "Cameron Harris",
+		"userPrincipalName": "cam@example.com",
+		"mail":              "cam@example.com",
+		"id":                "user-abc-123",
+		"jobTitle":          "Engineer",
+		"officeLocation":    "Remote",
+		"mobilePhone":       "+1 555 0100",
+		"preferredLanguage": "en-US",
 	})
 	if !ok {
 		t.Fatal("expected renderer to handle whoami")
