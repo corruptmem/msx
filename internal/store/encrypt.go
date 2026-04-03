@@ -52,9 +52,9 @@ const (
 type storeMode int
 
 const (
-	modePlain    storeMode = iota // no encryption
-	modeAES256GCM                 // AES-256-GCM with explicit key
-	modeKeyring                   // key from platform keyring
+	modePlain     storeMode = iota // no encryption
+	modeAES256GCM                  // AES-256-GCM with explicit key
+	modeKeyring                    // key from platform keyring
 )
 
 // keyConfig holds parsed configuration from MSX_STORE_KEY.
