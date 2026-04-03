@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,6 +41,67 @@ type Client struct {
 	BaseURL    string
 	HTTPClient *http.Client
 	Auth       tokenRefresher
+}
+
+func (c Client) RequestWithBody(method, path string, query map[string]string, body []byte) (map[string]any, error) {
+	if c.BaseURL == "" {
+		c.BaseURL = root
+	}
+	if c.HTTPClient == nil {
+		c.HTTPClient = DefaultHTTPClient()
+	}
+	if c.Auth == nil {
+		c.Auth = authRefresher{}
+	}
+	endpoint, err := c.buildEndpoint(path, query)
+	if err != nil {
+		return nil, err
+	}
+	return c.requestURLWithBody(method, endpoint, body, false)
+}
+
+func (c Client) requestURLWithBody(method, endpoint string, body []byte, forced bool) (map[string]any, error) {
+	var (
+		token store.Token
+		err   error
+	)
+	if forced {
+		token, err = c.Auth.ForceRefresh(c.Store, c.Profile)
+	} else {
+		token, err = c.Auth.RefreshIfNeeded(c.Store, c.Profile, 5*time.Minute)
+	}
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(method, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "msx/0")
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && !forced {
+		return c.requestURLWithBody(method, endpoint, body, true)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s", string(respBody))
+	}
+	if len(respBody) == 0 {
+		return map[string]any{}, nil
+	}
+	var out map[string]any
+	err = json.Unmarshal(respBody, &out)
+	return out, err
 }
 
 func (c Client) Request(method, path string, query map[string]string) (map[string]any, error) {

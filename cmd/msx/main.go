@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -33,25 +34,29 @@ var (
 const usageText = `usage: msx [--profile name] [--format text|json] <command> [flags]
 
 commands:
-  login         Start device-code login and save tokens locally
-  import-op     Import an existing Microsoft account from 1Password
-  state-export  Export one or all local profiles as JSON backup
-  state-import  Import profile state from a JSON backup
-  version       Show CLI version/build provenance
-  profiles      List configured profiles
-  whoami        Show the current Graph account
-  mail          List mail with optional filters
-  mail-get      Fetch one mail message by id
-  agenda        List calendar events in a time range
-  event-get     Fetch one calendar event by id
-  files         List or search OneDrive files
-  file-get      Fetch one OneDrive item by id
-  contacts      List or search contacts
-  contact-get   Fetch one contact by id
-  sites         Search SharePoint / org sites
-  site-get      Fetch one site by id
-  next          Continue from a returned @odata.nextLink URL
-  help          Show this message
+  login            Start device-code login and save tokens locally
+  import-op        Import an existing Microsoft account from 1Password
+  state-export     Export one or all local profiles as JSON backup
+  state-import     Import profile state from a JSON backup
+  version          Show CLI version/build provenance
+  profiles         List configured profiles
+  whoami           Show the current Graph account
+  mail             List mail with optional filters
+  mail-get         Fetch one mail message by id
+  agenda           List calendar events in a time range
+  event-get        Fetch one calendar event by id
+  files            List or search OneDrive files
+  file-get         Fetch one OneDrive item by id
+  folder-list      List contents of a OneDrive folder by item ID
+  file-download    Download a OneDrive file to a local path
+  file-move        Move a OneDrive item to a new parent folder
+  folder-create    Create a folder in OneDrive
+  contacts         List or search contacts
+  contact-get      Fetch one contact by id
+  sites            Search SharePoint / org sites
+  site-get         Fetch one site by id
+  next             Continue from a returned @odata.nextLink URL
+  help             Show this message
 `
 
 func main() {
@@ -111,6 +116,14 @@ func run(args []string) error {
 		return cmdFiles(s, g, rest)
 	case "file-get":
 		return cmdFileGet(s, g, rest)
+	case "folder-list":
+		return cmdFolderList(s, g, rest)
+	case "file-download":
+		return cmdFileDownload(s, g, rest)
+	case "file-move":
+		return cmdFileMove(s, g, rest)
+	case "folder-create":
+		return cmdFolderCreate(s, g, rest)
 	case "contacts":
 		return cmdContacts(s, g, rest)
 	case "contact-get":
@@ -344,6 +357,7 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	folder := fs.String("folder", "inbox", "well-known mail folder or folder id")
 	unread := fs.Bool("unread", false, "only include unread messages")
 	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
+	tzName := fs.String("tz", "UTC", "IANA timezone for receivedDateTime output (e.g. Europe/London)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -391,6 +405,11 @@ func cmdMail(s *store.Store, g globalFlags, args []string) error {
 	if *subject != "" {
 		data["value"] = filterMailBySubject(data["value"], *subject)
 	}
+	loc, err := parseLocation(*tzName)
+	if err != nil {
+		return err
+	}
+	convertMailTZ(data["value"], loc)
 	return emit(g, "mail", data)
 }
 
@@ -421,6 +440,7 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	end := fs.String("end", time.Now().UTC().Add(7*24*time.Hour).Format(time.RFC3339), "range end RFC3339")
 	query := fs.String("query", "", "search text applied client-side to subject/location/organizer")
 	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
+	tzName := fs.String("tz", "UTC", "IANA timezone for start/end dateTime output (e.g. America/New_York)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -462,6 +482,11 @@ func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
 	if *query != "" {
 		data["value"] = filterEvents(data["value"], *query)
 	}
+	agendaLoc, agendaErr := parseLocation(*tzName)
+	if agendaErr != nil {
+		return agendaErr
+	}
+	convertAgendaTZ(data["value"], agendaLoc)
 	return emit(g, "agenda", data)
 }
 
@@ -542,6 +567,184 @@ func cmdFileGet(s *store.Store, g globalFlags, args []string) error {
 		return err
 	}
 	return emit(g, "file-get", data)
+}
+
+func cmdFolderList(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("folder-list", flag.ContinueOnError)
+	top := fs.Int("top", 200, "maximum number of items")
+	nextLink := fs.String("next-link", "", "continue from a returned @odata.nextLink URL")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 && *nextLink == "" {
+		return fmt.Errorf("usage: msx folder-list [--top N] <drive-item-id>")
+	}
+	var (
+		data map[string]any
+		err  error
+	)
+	if *nextLink != "" {
+		if err := validateNextLink(*nextLink); err != nil {
+			return err
+		}
+		data, err = newGraphClient(s, g.profile).RequestURL("GET", *nextLink)
+	} else {
+		folderID := fs.Arg(0)
+		data, err = newGraphClient(s, g.profile).Request("GET",
+			"/me/drive/items/"+url.PathEscape(folderID)+"/children",
+			map[string]string{
+				"$top":    fmt.Sprint(*top),
+				"$select": "id,name,webUrl,file,folder,size,lastModifiedDateTime,parentReference",
+			})
+	}
+	if err != nil {
+		return err
+	}
+	return emit(g, "files", data)
+}
+
+func cmdFileDownload(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("file-download", flag.ContinueOnError)
+	out := fs.String("out", "", "local output path (default: filename in current directory)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx file-download [--out path] <drive-item-id>")
+	}
+	itemID := fs.Arg(0)
+
+	// First fetch item metadata to get the name
+	meta, err := newGraphClient(s, g.profile).Request("GET", "/me/drive/items/"+url.PathEscape(itemID),
+		map[string]string{"$select": "id,name,size"})
+	if err != nil {
+		return err
+	}
+	name, _ := meta["name"].(string)
+	if name == "" {
+		name = itemID
+	}
+	size, _ := meta["size"].(float64)
+
+	outPath := *out
+	if outPath == "" {
+		outPath = name
+	}
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return err
+	}
+
+	// Use the /content endpoint which redirects to a download URL — follow redirect
+	// Get a fresh token using the already-open store
+	token, err := auth.RefreshIfNeeded(s, g.profile, 5*time.Minute)
+	if err != nil {
+		return err
+	}
+
+	contentURL := "https://graph.microsoft.com/v1.0/me/drive/items/" + url.PathEscape(itemID) + "/content"
+	req, err := http.NewRequest("GET", contentURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
+	req.Header.Set("User-Agent", "msx/0")
+
+	httpClient := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("download failed %d: %s", resp.StatusCode, string(body))
+	}
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	written, err := io.Copy(f, resp.Body)
+	if err != nil {
+		return err
+	}
+	return emit(g, "file-download", map[string]any{
+		"ok":      true,
+		"item_id": itemID,
+		"name":    name,
+		"path":    outPath,
+		"bytes":   written,
+		"size":    int64(size),
+	})
+}
+
+func cmdFileMove(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("file-move", flag.ContinueOnError)
+	parentID := fs.String("parent-id", "", "destination folder drive-item ID")
+	newName := fs.String("name", "", "rename item (optional)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx file-move --parent-id <folder-id> [--name new-name] <drive-item-id>")
+	}
+	if *parentID == "" {
+		return fmt.Errorf("--parent-id is required")
+	}
+	itemID := fs.Arg(0)
+	body := map[string]any{
+		"parentReference": map[string]string{"id": *parentID},
+	}
+	if *newName != "" {
+		body["name"] = *newName
+	}
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	data, err := newGraphClient(s, g.profile).RequestWithBody("PATCH", "/me/drive/items/"+url.PathEscape(itemID), nil, bodyJSON)
+	if err != nil {
+		return err
+	}
+	return emit(g, "file-move", data)
+}
+
+func cmdFolderCreate(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("folder-create", flag.ContinueOnError)
+	parentID := fs.String("parent-id", "", "parent folder drive-item ID (default: drive root)")
+	parentPath := fs.String("parent-path", "", "parent folder path e.g. 'Documents/Personal Admin'")
+	conflict := fs.String("conflict", "fail", "behaviour if folder exists: fail|rename|replace")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: msx folder-create [--parent-id id | --parent-path path] [--conflict fail|rename|replace] <folder-name>")
+	}
+	folderName := fs.Arg(0)
+	var endpoint string
+	switch {
+	case *parentID != "":
+		endpoint = "/me/drive/items/" + url.PathEscape(*parentID) + "/children"
+	case *parentPath != "":
+		endpoint = "/me/drive/root:/" + strings.TrimPrefix(*parentPath, "/") + ":/children"
+	default:
+		endpoint = "/me/drive/root/children"
+	}
+	body := map[string]any{
+		"name":                              folderName,
+		"folder":                            map[string]any{},
+		"@microsoft.graph.conflictBehavior": *conflict,
+	}
+	bodyJSON, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	data, err := newGraphClient(s, g.profile).RequestWithBody("POST", endpoint, nil, bodyJSON)
+	if err != nil {
+		return err
+	}
+	return emit(g, "folder-create", data)
 }
 
 func cmdContacts(s *store.Store, g globalFlags, args []string) error {
@@ -986,6 +1189,69 @@ func filterRows(v any, keep func(map[string]any) bool) []map[string]any {
 		}
 	}
 	return out
+}
+
+// parseLocation loads an IANA timezone by name. "UTC" is the zero-value default.
+func parseLocation(name string) (*time.Location, error) {
+	if name == "" || name == "UTC" {
+		return time.UTC, nil
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("unknown timezone %q: %w", name, err)
+	}
+	return loc, nil
+}
+
+// convertTZ parses a datetime string (RFC3339 or Graph's truncated RFC3339)
+// and returns it formatted in loc with an explicit numeric offset.
+func convertTZ(loc *time.Location, s string) string {
+	if s == "" || loc == time.UTC {
+		return s
+	}
+	// Graph sometimes omits the trailing Z or offset; try a few layouts.
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.9999999", "2006-01-02T15:04:05"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.In(loc).Format(time.RFC3339)
+		}
+	}
+	return s // leave unchanged if unparseable
+}
+
+// convertMailTZ rewrites receivedDateTime fields in-place.
+func convertMailTZ(v any, loc *time.Location) {
+	if loc == time.UTC {
+		return
+	}
+	items, ok := v.([]map[string]any)
+	if !ok {
+		return
+	}
+	for _, item := range items {
+		if s, ok := item["receivedDateTime"].(string); ok {
+			item["receivedDateTime"] = convertTZ(loc, s)
+		}
+	}
+}
+
+// convertAgendaTZ rewrites start.dateTime and end.dateTime in-place.
+func convertAgendaTZ(v any, loc *time.Location) {
+	if loc == time.UTC {
+		return
+	}
+	items, ok := v.([]map[string]any)
+	if !ok {
+		return
+	}
+	for _, item := range items {
+		for _, key := range []string{"start", "end"} {
+			if nested, ok := item[key].(map[string]any); ok {
+				if s, ok := nested["dateTime"].(string); ok {
+					nested["dateTime"] = convertTZ(loc, s)
+				}
+			}
+		}
+	}
 }
 
 func requirePositive(name string, v int) error {
