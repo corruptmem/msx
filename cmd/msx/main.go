@@ -43,6 +43,8 @@ commands:
   whoami           Show the current Graph account
   mail             List mail with optional filters
   mail-get         Fetch one mail message by id
+  mail-move        Move one or more mail messages to another folder
+  mail-archive     Move one or more mail messages to Archive
   agenda           List calendar events in a time range
   event-get        Fetch one calendar event by id
   files            List or search OneDrive files
@@ -108,6 +110,10 @@ func run(args []string) error {
 		return cmdMail(s, g, rest)
 	case "mail-get":
 		return cmdMailGet(s, g, rest)
+	case "mail-move":
+		return cmdMailMove(s, g, rest)
+	case "mail-archive":
+		return cmdMailArchive(s, g, rest)
 	case "agenda":
 		return cmdAgenda(s, g, rest)
 	case "event-get":
@@ -431,6 +437,59 @@ func cmdMailGet(s *store.Store, g globalFlags, args []string) error {
 		return err
 	}
 	return emit(g, "mail-get", data)
+}
+
+func cmdMailMove(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("mail-move", flag.ContinueOnError)
+	destination := fs.String("destination", "", "destination folder id or well-known folder name")
+	destinationAlias := fs.String("dest-folder", "", "alias for --destination")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *destination == "" {
+		*destination = *destinationAlias
+	}
+	if *destination == "" || fs.NArg() == 0 {
+		return fmt.Errorf("usage: msx mail-move --destination <folder-id|well-known-name> <message-id> [message-id ...]")
+	}
+	return runMailMove(s, g, *destination, fs.Args(), "mail-move")
+}
+
+func cmdMailArchive(s *store.Store, g globalFlags, args []string) error {
+	fs := flag.NewFlagSet("mail-archive", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() == 0 {
+		return fmt.Errorf("usage: msx mail-archive <message-id> [message-id ...]")
+	}
+	return runMailMove(s, g, "archive", fs.Args(), "mail-archive")
+}
+
+func runMailMove(s *store.Store, g globalFlags, destination string, ids []string, command string) error {
+	client := newGraphClient(s, g.profile)
+	results := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		body, err := json.Marshal(map[string]any{"destinationId": destination})
+		if err != nil {
+			return err
+		}
+		data, err := client.RequestWithBody("POST", "/me/messages/"+url.PathEscape(id)+"/move", nil, body)
+		if err != nil {
+			return fmt.Errorf("move %s: %w", id, err)
+		}
+		results = append(results, data)
+	}
+	return emit(g, command, map[string]any{
+		"ok":          true,
+		"destination": destination,
+		"count":       len(results),
+		"value":       results,
+	})
 }
 
 func cmdAgenda(s *store.Store, g globalFlags, args []string) error {
