@@ -196,6 +196,63 @@ func TestRunDetailCommandsAndNextAgainstTestServer(t *testing.T) {
 	}
 }
 
+func TestRunMailMoveAndArchiveCommands(t *testing.T) {
+	t.Setenv("MSX_HOME", t.TempDir())
+	seedProfile(t, os.Getenv("MSX_HOME"), "personal")
+
+	var moved []struct {
+		Path string
+		Body string
+	}
+	withGraphHTTPClient(t, func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST, got %s", r.Method)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		moved = append(moved, struct {
+			Path string
+			Body string
+		}{Path: r.URL.Path, Body: string(body)})
+		if strings.HasSuffix(r.URL.Path, "/msg-1/move") {
+			return jsonHTTPResponse(http.StatusOK, `{"id":"msg-1-moved","subject":"hello"}`), nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/msg-2/move") {
+			return jsonHTTPResponse(http.StatusOK, `{"id":"msg-2-moved","subject":"bye"}`), nil
+		}
+		t.Fatalf("unexpected request path: %s", r.URL.Path)
+		return nil, nil
+	})
+	t.Setenv("MSX_GRAPH_BASE_URL", "https://graph.example.test/v1.0")
+
+	stdout, stderr, err := captureRun([]string{"--profile", "personal", "mail-move", "--destination", "Archive", "msg-1"})
+	if err != nil {
+		t.Fatalf("mail-move failed: %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"destination": "Archive"`) || !strings.Contains(stdout, `"count": 1`) {
+		t.Fatalf("unexpected mail-move stdout: %s", stdout)
+	}
+
+	stdout, stderr, err = captureRun([]string{"--profile", "personal", "mail-archive", "msg-2"})
+	if err != nil {
+		t.Fatalf("mail-archive failed: %v stderr=%s", err, stderr)
+	}
+	if !strings.Contains(stdout, `"destination": "archive"`) || !strings.Contains(stdout, `"count": 1`) {
+		t.Fatalf("unexpected mail-archive stdout: %s", stdout)
+	}
+	if len(moved) != 2 {
+		t.Fatalf("expected 2 move calls, got %d", len(moved))
+	}
+	if moved[0].Path != "/v1.0/me/messages/msg-1/move" || !strings.Contains(moved[0].Body, `"destinationId":"Archive"`) {
+		t.Fatalf("unexpected first move call: %+v", moved[0])
+	}
+	if moved[1].Path != "/v1.0/me/messages/msg-2/move" || !strings.Contains(moved[1].Body, `"destinationId":"archive"`) {
+		t.Fatalf("unexpected second move call: %+v", moved[1])
+	}
+}
+
 func TestRunMailSubjectFilterPreservesTopLevelShape(t *testing.T) {
 	t.Setenv("MSX_HOME", t.TempDir())
 	seedProfile(t, os.Getenv("MSX_HOME"), "personal")
