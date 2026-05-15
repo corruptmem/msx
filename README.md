@@ -294,8 +294,8 @@ msx contact-get --profile personal AAMkAG...
 ### SharePoint / org sites
 
 ```bash
-msx sites --profile hexlium --query hexlium
-msx site-get --profile hexlium contoso.sharepoint.com,1234abcd-0000-1111-2222-abcdefabcdef,9876dcba-3333-4444-5555-fedcbafedcba
+msx sites --profile profilename --query hexlium
+msx site-get --profile profilename contoso.sharepoint.com,1234abcd-0000-1111-2222-abcdefabcdef,9876dcba-3333-4444-5555-fedcbafedcba
 ```
 
 ### Pagination continuation
@@ -383,11 +383,6 @@ GitHub Actions now provides two lanes:
 
 Local dogfooding should prefer those packaged artifacts over ad-hoc local builds.
 
-## Verified non-destructive flows
-
-Tested against the existing configured accounts:
-- `MS Personal`: import, `whoami`, `mail`, `agenda`, `files`, mail search, file search
-- `MS Hexlium`: import, `whoami`, `mail`, `agenda`
 
 ## Project tracking
 
