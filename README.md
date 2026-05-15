@@ -294,7 +294,7 @@ msx contact-get --profile personal AAMkAG...
 ### SharePoint / org sites
 
 ```bash
-msx sites --profile profilename --query hexlium
+msx sites --profile profilename --query querytext
 msx site-get --profile profilename contoso.sharepoint.com,1234abcd-0000-1111-2222-abcdefabcdef,9876dcba-3333-4444-5555-fedcbafedcba
 ```
 
