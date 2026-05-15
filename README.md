@@ -2,14 +2,6 @@
 
 A Microsoft Graph CLI built for both humans and agents.
 
-The design priority is not breadth. It is **auth durability**:
-- store both access and refresh tokens on disk
-- rotate refresh tokens safely when Microsoft returns a new one
-- preserve the existing refresh token if Microsoft does not return a replacement during refresh
-- avoid partial writes and token-loss corruption
-- isolate profiles cleanly across personal and org accounts
-- make the CLI predictable for automation
-
 ## What it does already
 
 ### Durable auth layer
